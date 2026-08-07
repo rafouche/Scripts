@@ -1782,7 +1782,11 @@ function Show-MainForm {
         }
 
         $total   = $lv2.Items.Count
-        $checked = ($lv2.Items | Where-Object { $_.Checked }).Count
+        # @(...) forces array context -- Where-Object with zero matches returns
+        # $null, and $null.Count throws under Set-StrictMode -Version Latest
+        # (normally PowerShell auto-resolves .Count on $null to 0, but strict
+        # mode disables that convenience).
+        $checked = @($lv2.Items | Where-Object { $_.Checked }).Count
         $lblSel.Text = "$total user(s) listed  |  $checked checked"
         $btnResolve.Enabled     = ($total -gt 0)
         $btnBatchApply.Enabled  = ($checked -gt 0)
@@ -1792,7 +1796,11 @@ function Show-MainForm {
     # Update count label on check change
     $lv2.Add_ItemChecked({
         $total   = $lv2.Items.Count
-        $checked = ($lv2.Items | Where-Object { $_.Checked }).Count
+        # @(...) forces array context -- Where-Object with zero matches returns
+        # $null, and $null.Count throws under Set-StrictMode -Version Latest
+        # (normally PowerShell auto-resolves .Count on $null to 0, but strict
+        # mode disables that convenience).
+        $checked = @($lv2.Items | Where-Object { $_.Checked }).Count
         $lblSel.Text = "$total user(s) listed  |  $checked checked"
         $btnBatchApply.Enabled = ($checked -gt 0)
     })
