@@ -287,8 +287,12 @@ function Get-CertConfig {
     $thumb = $script:Config['CertThumbprint']
     $tid   = $script:Config['TenantId']
     if ($appId -and $thumb -and $tid) {
-        $c = Get-Item "Cert:\LocalMachine\My\$thumb" -ErrorAction SilentlyContinue
-        if ($c -and $c.NotAfter -gt (Get-Date)) { return $script:Config }
+        # NOTE: must not be named $c/$C -- PowerShell variable names are
+        # case-insensitive and this would shadow the script-scope $C color
+        # palette hashtable for the rest of this function's call stack,
+        # breaking any Write-Log call made afterward (see Connect-ToGraph).
+        $certObj = Get-Item "Cert:\LocalMachine\My\$thumb" -ErrorAction SilentlyContinue
+        if ($certObj -and $certObj.NotAfter -gt (Get-Date)) { return $script:Config }
     }
     return $null
 }
@@ -556,11 +560,18 @@ function Connect-ToGraph {
     # token (e.g. after PS7 relaunch, UAC elevation, or Ninja SYSTEM context).
     $cert = $null
     foreach ($store in @('LocalMachine','CurrentUser')) {
-        $c = Get-Item "Cert:\$store\My\$thumb" -ErrorAction SilentlyContinue
-        if ($c) {
+        # NOTE: must not be named $c/$C -- PowerShell variable names are
+        # case-insensitive, and Write-Log resolves $C (the color palette
+        # hashtable) by walking up the caller's scope chain. A local $c here
+        # would shadow it for every Write-Log call made for the rest of this
+        # function, throwing "The property 'X' cannot be found on this
+        # object" the moment Write-Log tries $C.Warning/.FGDim/etc. against
+        # the certificate object instead of the palette.
+        $certObj = Get-Item "Cert:\$store\My\$thumb" -ErrorAction SilentlyContinue
+        if ($certObj) {
             try {
-                $null = $c.PrivateKey   # throws if keyset inaccessible in this context
-                $cert = $c
+                $null = $certObj.PrivateKey   # throws if keyset inaccessible in this context
+                $cert = $certObj
                 Write-Log "Certificate found in $store\My store." 'INFO'
                 break
             } catch {
