@@ -329,6 +329,23 @@ function Set-Status {
     }
 }
 
+# Safely pull a display string out of a caught error. Some Graph SDK exception
+# types throw their own error (e.g. "The property 'Warning' cannot be found
+# on this object") when PowerShell tries to stringify them (`"$_"`/.ToString())
+# -- known Microsoft.Graph SDK behavior, sometimes triggered by a stale/mixed
+# module session (e.g. Az.Accounts also loaded). Reading .Exception.Message
+# directly avoids invoking that broken stringification path; if even that
+# fails, fall back to a generic message instead of crashing the caller.
+function Get-SafeErrorText {
+    param($ErrorRecord)
+    try {
+        if ($ErrorRecord.Exception -and $ErrorRecord.Exception.Message) {
+            return $ErrorRecord.Exception.Message
+        }
+    } catch {}
+    return 'Unknown error (failed to read exception details -- check for a stale/mixed PowerShell module session, e.g. Az.Accounts loaded alongside Microsoft.Graph).'
+}
+
 function New-Btn {
     param([string]$Text,[int]$W=120,[int]$H=30,[System.Drawing.Color]$BG)
     $b = [System.Windows.Forms.Button]::new()
@@ -566,7 +583,7 @@ function Connect-ToGraph {
         Write-Log 'Graph connected.' 'OK'
         return $true
     } catch {
-        Write-Log "Graph connect failed: $_" 'ERR'
+        Write-Log "Graph connect failed: $(Get-SafeErrorText $_)" 'ERR'
         return $false
     }
 }
@@ -703,7 +720,7 @@ function Initialize-M365Auth {
         return $true
     }
     catch {
-        Write-Log "Setup error: $_" 'ERR'
+        Write-Log "Setup error: $(Get-SafeErrorText $_)" 'ERR'
         if ((Test-Path variable:cert) -and $cert) {
             try { Remove-Item "Cert:\LocalMachine\My\$($cert.Thumbprint)" -DeleteKey -ErrorAction SilentlyContinue } catch {}
         }
@@ -910,7 +927,7 @@ function Invoke-HardMatch {
             Update-MgUser -UserId $EntraUser.Id `
                 -OnPremisesImmutableId $targetId -EA Stop
         } catch {
-            $msg = $_.ToString()
+            $msg = Get-SafeErrorText $_
             if ($msg -match 'onPremisesImmutableId' -and $msg -match '400') {
                 return 'Conflict'
             }
@@ -1867,6 +1884,15 @@ function Show-MainForm {
 # ---------------------------------------------------------------
 if (-not $SkipModuleCheck) { Invoke-ModuleBootstrap }
 
+# Az.Accounts and Microsoft.Graph share underlying auth/token-cache assemblies;
+# having both loaded in the same session is a known cause of the SDK throwing
+# odd PowerShell errors (e.g. "The property 'Warning' cannot be found on this
+# object") when Connect-MgGraph is called. Flag it early rather than let it
+# surface as a confusing crash later.
+if (Get-Module -Name Az.Accounts -ErrorAction SilentlyContinue) {
+    Write-Log "Az.Accounts module is also loaded in this session -- this is a known cause of odd Microsoft.Graph SDK errors (e.g. \"property 'Warning' cannot be found\"). If Graph auth fails below, close this session and re-run in a fresh PowerShell 7 window." 'WARN'
+}
+
 # If ADM365Config.json is missing or incomplete, offer the same one-time Setup
 # Auth wizard used by Onboard-ADUser.ps1 / Offboard-ADUser.ps1 before trying to
 # connect -- it creates the shared "ADM365LifecycleTool" app + cert and writes
@@ -1880,10 +1906,18 @@ if (-not $script:_cfgReady) {
     $r = [System.Windows.Forms.MessageBox]::Show(
         "No M365 auth is configured yet ($script:ConfigPath is missing or incomplete).`r`n`r`nRun the one-time Setup Auth wizard now? This is the same setup used by Onboard-ADUser.ps1 / Offboard-ADUser.ps1 -- it creates a shared app registration + certificate and writes them to ADM365Config.json.`r`n`r`nRequires a Global Admin sign-in.",
         'M365 Auth Not Configured', 'YesNo', 'Question')
-    if ($r -eq 'Yes') { $null = Initialize-M365Auth }
+    if ($r -eq 'Yes') {
+        try { $null = Initialize-M365Auth }
+        catch { Write-Log "Setup Auth crashed unexpectedly: $(Get-SafeErrorText $_)" 'ERR' }
+    }
 }
 
-$graphOk = Connect-ToGraph
+try {
+    $graphOk = Connect-ToGraph
+} catch {
+    Write-Log "Connect-ToGraph crashed unexpectedly: $(Get-SafeErrorText $_)" 'ERR'
+    $graphOk = $false
+}
 if (-not $graphOk) {
     if ($script:IsCLI) {
         Write-Log 'Graph connection failed -- cannot proceed in CLI mode.' 'ERR'

@@ -1,0 +1,8 @@
+# Per-machine/per-tenant secret material -- never commit real values.
+ADM365Config.json
+*.local.json
+*secret*
+*credentials*
+
+# Run logs written next to scripts
+*.log
