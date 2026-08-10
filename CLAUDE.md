@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this folder is
 
-A flat collection of independent, standalone PowerShell/cmd scripts used by an MSP (Altec Solutions Group) for Windows endpoint and Active Directory/M365 administration — onboarding/offboarding, AD-to-Entra identity sync, VPN provisioning, agent (RMM/EDR) removal, and workstation cleanup/hardening. There is no project structure, no package manifest, no build step, and no shared library — each `.ps1`/`.cmd` file is self-contained and run directly (double-clicked, run from an elevated PowerShell prompt, or invoked by NinjaRMM). This is **not** a git repository (no `.git` folder); there is no version history to check before editing.
+A flat collection of independent, standalone PowerShell/cmd scripts used by an MSP (Altec Solutions Group) for Windows endpoint and Active Directory/M365 administration — onboarding/offboarding, AD-to-Entra identity sync, VPN provisioning, agent (RMM/EDR) removal, and workstation cleanup/hardening. There is no project structure, no package manifest, no build step, and no shared library — each `.ps1`/`.cmd` file is self-contained and run directly (double-clicked, run from an elevated PowerShell prompt, or invoked by NinjaRMM).
+
+This folder **is** a git repository (`master` branch) with `origin` set to `https://github.com/rafouche/Scripts.git` — check `git log`/`git status` before editing, and commit (and push, once the local GitHub credential is cached) after any script change so history stays on GitHub rather than only on disk. Pushing may require running `git push` from an interactive terminal the first time, since this machine has no cached GitHub credential or SSH key yet — Git Credential Manager will prompt via browser.
 
 Several of these scripts are designed to be triggered by NinjaRMM as automation scripts (see `mcp__88622519...__run_script_on_device` / `list_automation_scripts` if working through the NinjaRMM MCP) — CLI parameters exist specifically for that non-interactive invocation path, separate from each script's GUI mode.
 
