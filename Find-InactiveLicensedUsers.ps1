@@ -616,8 +616,31 @@ try {
     Write-Host " is licensed in this tenant - otherwise signInActivity reads back empty." -ForegroundColor Yellow
     Write-Host "============================================" -ForegroundColor Green
 } catch {
-    $result.ErrorMessage = "$_"
-    Write-Host "[ERROR] Setup failed: $_" -ForegroundColor Red
+    $errLine = $_.InvocationInfo.ScriptLineNumber
+    $diag = New-Object System.Collections.Generic.List[string]
+    try {
+        $diag.Add("PSVersion: $($PSVersionTable.PSVersion)")
+        $wi = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $diag.Add("Running as: $($wi.Name)")
+        $wp = New-Object Security.Principal.WindowsPrincipal($wi)
+        $diag.Add("Elevated: $($wp.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator))")
+        $diag.Add("PSModulePath entries:")
+        ($env:PSModulePath -split ";") | ForEach-Object { $diag.Add("  $_") }
+        $diag.Add("Get-Module -ListAvailable for the three imported modules:")
+        foreach ($mn in @("Microsoft.Graph.Authentication","Microsoft.Graph.Applications","Microsoft.Graph.Identity.DirectoryManagement")) {
+            $mods = Get-Module -ListAvailable -Name $mn -ErrorAction SilentlyContinue
+            if ($mods) { foreach ($m in $mods) { $diag.Add("  $mn $($m.Version) -> $($m.ModuleBase)") } }
+            else { $diag.Add("  $mn : NOT FOUND") }
+        }
+        $diag.Add("Loaded assemblies matching Microsoft.Graph*:")
+        [AppDomain]::CurrentDomain.GetAssemblies() | Where-Object { $_.GetName().Name -like "Microsoft.Graph*" } | ForEach-Object {
+            $diag.Add("  $($_.GetName().Name) v$($_.GetName().Version) -> $($_.Location)")
+        }
+    } catch { $diag.Add("diagnostic collection error: $_") }
+
+    $result.ErrorMessage = "$_ (failed at line $errLine)`n---DIAGNOSTICS---`n" + ($diag -join "`n")
+    Write-Host "[ERROR] Setup failed: $_ (line $errLine)" -ForegroundColor Red
+    $diag | ForEach-Object { Write-Host $_ -ForegroundColor DarkGray }
     if ((Test-Path variable:cert) -and $cert) {
         try { Remove-Item "Cert:\LocalMachine\My\$($cert.Thumbprint)" -DeleteKey -ErrorAction SilentlyContinue } catch {}
     }
