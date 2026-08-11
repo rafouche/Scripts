@@ -235,6 +235,81 @@ function Invoke-ModuleBootstrap {
     BL "Module check complete." "OK"
 }
 
+function Repair-GraphModuleVersionSkew {
+    # A -MinimumVersion check per module (as above) only guarantees each Microsoft.Graph.*
+    # submodule is AT LEAST some old floor version - it says nothing about whether the
+    # submodules match EACH OTHER. On a machine where Authentication got upgraded (e.g. by
+    # some other install/update) while Applications/Identity.DirectoryManagement did not,
+    # each ends up on a different version in a different module path (PS7-native vs the
+    # legacy Windows PowerShell path PS7 still sees for compatibility). Import-Module then
+    # resolves Authentication to the newest available version, but Applications pulls in
+    # its OWN required (older) Authentication version internally - two different physical
+    # DLLs claiming the same assembly identity, which throws "Assembly with same name is
+    # already loaded" the instant both are imported, even in a brand-new process. Force the
+    # whole family to one exact matching version to eliminate the skew.
+    param([bool]$Silent = $false)
+
+    function RGL { param($m, $l = "INFO")
+        if (-not $Silent) {
+            $c = switch ($l) { "OK" { "Green" } "WARN" { "Yellow" } "ERR" { "Red" } default { "Cyan" } }
+            Write-Host "[$(Get-Date -Format 'HH:mm:ss')][$l] $m" -ForegroundColor $c
+        }
+    }
+
+    $graphModules = @("Microsoft.Graph.Authentication", "Microsoft.Graph.Users", "Microsoft.Graph.Applications", "Microsoft.Graph.Identity.DirectoryManagement")
+
+    RGL "Checking Microsoft.Graph module family for version skew across module paths..."
+
+    try {
+        $target = (Find-Module -Name "Microsoft.Graph.Authentication" -Repository PSGallery -ErrorAction Stop).Version
+    } catch {
+        RGL "Could not query PSGallery for the latest Microsoft.Graph.Authentication version - skipping version-skew repair: $_" "WARN"
+        return
+    }
+
+    $skewFound = $false
+    foreach ($mn in $graphModules) {
+        $installed = Get-Module -ListAvailable -Name $mn -ErrorAction SilentlyContinue
+        $hasTarget = $installed | Where-Object { $_.Version -eq $target }
+        $others    = $installed | Where-Object { $_.Version -ne $target }
+        if (-not $hasTarget -or $others) { $skewFound = $true }
+    }
+
+    if (-not $skewFound) {
+        RGL "Graph module family consistently at $target - no repair needed." "OK"
+        return
+    }
+
+    RGL "Version skew detected across the Microsoft.Graph module family - aligning everything to $target (AllUsers)..." "WARN"
+    foreach ($mn in $graphModules) {
+        $installed = Get-Module -ListAvailable -Name $mn -ErrorAction SilentlyContinue
+        foreach ($old in ($installed | Where-Object { $_.Version -ne $target })) {
+            try {
+                RGL "Removing $mn $($old.Version) ($($old.ModuleBase))..."
+                Uninstall-Module -Name $mn -RequiredVersion $old.Version -Force -ErrorAction Stop
+                RGL "Removed $mn $($old.Version)." "OK"
+            } catch {
+                # Not every module folder is tracked by PowerShellGet (e.g. bundled by an
+                # MSI or copied in manually) - Uninstall-Module can't touch those. Since this
+                # process is already elevated, fall back to deleting the version folder.
+                try {
+                    Remove-Item -Path $old.ModuleBase -Recurse -Force -ErrorAction Stop
+                    RGL "Removed $mn $($old.Version) by deleting $($old.ModuleBase)." "OK"
+                } catch { RGL "Could not remove $mn $($old.Version): $_" "ERR" }
+            }
+        }
+        $hasTarget = Get-Module -ListAvailable -Name $mn -ErrorAction SilentlyContinue | Where-Object { $_.Version -eq $target }
+        if (-not $hasTarget) {
+            try {
+                RGL "Installing $mn $target (AllUsers)..."
+                Install-Module -Name $mn -RequiredVersion $target -Scope AllUsers -Force -AllowClobber -Repository PSGallery -ErrorAction Stop
+                RGL "$mn $target installed." "OK"
+            } catch { RGL "Failed to install $mn ${target}: $_" "ERR" }
+        }
+    }
+    RGL "Graph module version-skew repair complete." "OK"
+}
+
 # ============================================================
 # SECTION 0b - M365 ROLE VERIFICATION
 # ============================================================
@@ -322,7 +397,10 @@ $isSilent = $ReportOnly.IsPresent
 
 Write-Host "[$(Get-Date -Format 'HH:mm:ss')][INFO] Entra ID Inactive Licensed User Scanner - v1.0" -ForegroundColor Magenta
 
-if (-not $SkipModuleCheck) { Invoke-ModuleBootstrap -Silent:$isSilent }
+if (-not $SkipModuleCheck) {
+    Invoke-ModuleBootstrap -Silent:$isSilent
+    Repair-GraphModuleVersionSkew -Silent:$isSilent
+}
 $null = Import-Module ExchangeOnlineManagement -ErrorAction SilentlyContinue
 
 # Separate config file from Offboard-ADUser.ps1's ADM365Config.json on purpose -
