@@ -489,19 +489,38 @@ function Connect-ToGraph {
 }
 
 function Connect-M365Graph {
-    param([string[]]$FallbackScopes = @("User.ReadWrite.All", "AuditLog.Read.All", "Organization.Read.All", "Directory.Read.All"))
+    param(
+        [string[]]$FallbackScopes = @("User.ReadWrite.All", "AuditLog.Read.All", "Organization.Read.All", "Directory.Read.All"),
+        [System.Windows.Forms.RichTextBox]$LogBox = $null
+    )
     $verArgs = @{}
     if ($script:GraphModuleTargetVersion) { $verArgs['RequiredVersion'] = $script:GraphModuleTargetVersion }
     $null = Import-Module Microsoft.Graph.Authentication @verArgs -ErrorAction Stop
+
+    # Force a clean slate. If an earlier interactive Connect-MgGraph happened in this same
+    # process (Role Bootstrap runs one at startup whenever no cert config exists YET - i.e.
+    # exactly the state the very first Setup Auth run starts from) and this call reconnects
+    # with the cert instead, don't rely on the SDK to fully swap contexts mid-session -
+    # disconnect explicitly first so there is no ambiguity about which identity's token the
+    # next API call actually carries.
+    try { Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null } catch {}
+
     $cfg = Get-CertConfig
     if ($cfg) {
         $ok = Connect-ToGraph
         if (-not $ok) { throw "Certificate-based Graph connection failed - see log." }
     } else {
-        Write-Log "Graph: interactive auth - run 'Setup Auth' to enable non-interactive + sign-in activity read." "WARN"
+        Write-Log "Graph: interactive auth - run 'Setup Auth' to enable non-interactive + sign-in activity read." "WARN" $LogBox
         $null = Connect-MgGraph -Scopes $FallbackScopes -NoWelcome -ErrorAction Stop
         $ctx = Get-MgContext
         if ($ctx -and $ctx.TenantId -and -not $script:Config.TenantId) { $script:Config.TenantId = $ctx.TenantId; Save-Config }
+    }
+
+    $finalCtx = Get-MgContext
+    if ($finalCtx) {
+        Write-Log "Graph context: AuthType=$($finalCtx.AuthType)  ClientId=$($finalCtx.ClientId)  Account=$($finalCtx.Account)  Scopes=$($finalCtx.Scopes -join ',')" "INFO" $LogBox
+    } else {
+        Write-Log "Graph context: Get-MgContext returned nothing after connecting - unexpected." "WARN" $LogBox
     }
 }
 
@@ -860,7 +879,7 @@ function Get-InactiveLicensedUsers {
         [System.Windows.Forms.RichTextBox]$LogBox = $null
     )
 
-    Connect-M365Graph
+    Connect-M365Graph -LogBox $LogBox
     $cutoff = (Get-Date).ToUniversalTime().AddDays(-$InactiveDays)
 
     Write-Log "Retrieving licensed users (this can take a while on large tenants)..." "INFO" $LogBox
@@ -1220,6 +1239,32 @@ $btnScan.Add_Click({
     } catch {
         $lblStatus.ForeColor = $DANGER; $lblStatus.Text = "[X] Scan failed - see log."
         Write-Log "Scan error: $_" "ERROR" $logBox
+
+        if ("$_" -match "403|Authorization_RequestDenied") {
+            Write-Log "403 detected - running two follow-up probes to isolate the cause..." "WARN" $logBox
+            try {
+                $ctx = Get-MgContext
+                if ($ctx) {
+                    Write-Log "Context at failure time: AuthType=$($ctx.AuthType)  ClientId=$($ctx.ClientId)  Account=$($ctx.Account)  Scopes=$($ctx.Scopes -join ',')" "INFO" $logBox
+                } else {
+                    Write-Log "Context at failure time: Get-MgContext returned nothing." "WARN" $logBox
+                }
+            } catch { Write-Log "Could not read Get-MgContext: $_" "WARN" $logBox }
+
+            try {
+                $probe1 = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/users?`$top=1&`$select=id,displayName" -ErrorAction Stop
+                Write-Log "Probe 1 (basic /users query, no signInActivity): SUCCEEDED - $($probe1.value.Count) result(s). Confirms the token/permissions work for basic reads; the failure is specific to signInActivity." "SUCCESS" $logBox
+            } catch {
+                Write-Log "Probe 1 (basic /users query, no signInActivity): FAILED - $_. The token itself lacks basic Directory/User read - broader than just signInActivity." "ERROR" $logBox
+            }
+
+            try {
+                $probe2 = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/users?`$top=1&`$select=id,displayName,signInActivity" -Headers @{ ConsistencyLevel = "eventual" } -ErrorAction Stop
+                Write-Log "Probe 2 (signInActivity + ConsistencyLevel:eventual header): SUCCEEDED - $($probe2.value.Count) result(s). The eventual-consistency header appears to be required for this tenant." "SUCCESS" $logBox
+            } catch {
+                Write-Log "Probe 2 (signInActivity + ConsistencyLevel:eventual header): FAILED - $_" "ERROR" $logBox
+            }
+        }
     } finally { $btnScan.Enabled = $true }
 })
 
