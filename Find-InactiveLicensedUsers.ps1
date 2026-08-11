@@ -242,12 +242,26 @@ function Repair-GraphModuleVersionSkew {
     # submodules match EACH OTHER. On a machine where Authentication got upgraded (e.g. by
     # some other install/update) while Applications/Identity.DirectoryManagement did not,
     # each ends up on a different version in a different module path (PS7-native vs the
-    # legacy Windows PowerShell path PS7 still sees for compatibility). Import-Module then
-    # resolves Authentication to the newest available version, but Applications pulls in
-    # its OWN required (older) Authentication version internally - two different physical
-    # DLLs claiming the same assembly identity, which throws "Assembly with same name is
-    # already loaded" the instant both are imported, even in a brand-new process. Force the
-    # whole family to one exact matching version to eliminate the skew.
+    # legacy Windows PowerShell path PS7 still sees for compatibility). Unversioned
+    # Import-Module then resolves Authentication to the newest available version, but
+    # Applications pulls in its OWN required (older) Authentication version internally -
+    # two different physical DLLs claiming the same assembly identity, which throws
+    # "Assembly with same name is already loaded" the instant both are imported, even in a
+    # brand-new process.
+    #
+    # Uninstalling the mismatched old versions to force alignment sounds right but is
+    # fragile in practice: on a server also running AAD Connect Sync / AAD App Proxy
+    # Connector / SPO Management Shell (all of which showed up in this exact failure's
+    # PSModulePath), some background service or scheduled task may already have those exact
+    # DLLs open, and Windows won't let anyone - Admin included - delete or replace a file
+    # another process holds a handle to. Confirmed on a live Server 2019 box: repeated
+    # elevated repair attempts left the module versions completely unchanged.
+    #
+    # Side-by-side module versions are normal and safe in PowerShell, so instead of fighting
+    # file locks, just make sure the target version is ALSO installed (never touching the
+    # old ones) and expose it via $script:GraphModuleTargetVersion so every Import-Module
+    # call for this family can pin -RequiredVersion explicitly. An explicit version request
+    # is never ambiguous, so the stale older copies become permanently harmless.
     param([bool]$Silent = $false)
 
     function RGL { param($m, $l = "INFO")
@@ -260,56 +274,42 @@ function Repair-GraphModuleVersionSkew {
 
     $graphModules = @("Microsoft.Graph.Authentication", "Microsoft.Graph.Users", "Microsoft.Graph.Applications", "Microsoft.Graph.Identity.DirectoryManagement")
 
-    RGL "Checking Microsoft.Graph module family for version skew across module paths..."
+    RGL "Resolving a pinned Microsoft.Graph module version for this family (avoids ambiguous version resolution instead of trying to remove old copies)..."
 
+    $target = $null
     try {
         $target = (Find-Module -Name "Microsoft.Graph.Authentication" -Repository PSGallery -ErrorAction Stop).Version
+        RGL "Latest on PSGallery: $target"
     } catch {
-        RGL "Could not query PSGallery for the latest Microsoft.Graph.Authentication version - skipping version-skew repair: $_" "WARN"
-        return
-    }
-
-    $skewFound = $false
-    foreach ($mn in $graphModules) {
-        $installed = Get-Module -ListAvailable -Name $mn -ErrorAction SilentlyContinue
-        $hasTarget = $installed | Where-Object { $_.Version -eq $target }
-        $others    = $installed | Where-Object { $_.Version -ne $target }
-        if (-not $hasTarget -or $others) { $skewFound = $true }
-    }
-
-    if (-not $skewFound) {
-        RGL "Graph module family consistently at $target - no repair needed." "OK"
-        return
-    }
-
-    RGL "Version skew detected across the Microsoft.Graph module family - aligning everything to $target (AllUsers)..." "WARN"
-    foreach ($mn in $graphModules) {
-        $installed = Get-Module -ListAvailable -Name $mn -ErrorAction SilentlyContinue
-        foreach ($old in ($installed | Where-Object { $_.Version -ne $target })) {
-            try {
-                RGL "Removing $mn $($old.Version) ($($old.ModuleBase))..."
-                Uninstall-Module -Name $mn -RequiredVersion $old.Version -Force -ErrorAction Stop
-                RGL "Removed $mn $($old.Version)." "OK"
-            } catch {
-                # Not every module folder is tracked by PowerShellGet (e.g. bundled by an
-                # MSI or copied in manually) - Uninstall-Module can't touch those. Since this
-                # process is already elevated, fall back to deleting the version folder.
-                try {
-                    Remove-Item -Path $old.ModuleBase -Recurse -Force -ErrorAction Stop
-                    RGL "Removed $mn $($old.Version) by deleting $($old.ModuleBase)." "OK"
-                } catch { RGL "Could not remove $mn $($old.Version): $_" "ERR" }
-            }
+        RGL "Could not query PSGallery for the latest version ($_) - falling back to the highest version already installed locally." "WARN"
+        $target = (Get-Module -ListAvailable -Name "Microsoft.Graph.Authentication" -ErrorAction SilentlyContinue | Sort-Object Version -Descending | Select-Object -First 1).Version
+        if (-not $target) {
+            RGL "No local Microsoft.Graph.Authentication install found either - cannot pin a version. Import-Module calls will fall back to unpinned (may still hit the assembly conflict)." "ERR"
+            return
         }
+        RGL "Using locally-installed version: $target" "WARN"
+    }
+
+    foreach ($mn in $graphModules) {
         $hasTarget = Get-Module -ListAvailable -Name $mn -ErrorAction SilentlyContinue | Where-Object { $_.Version -eq $target }
-        if (-not $hasTarget) {
-            try {
-                RGL "Installing $mn $target (AllUsers)..."
-                Install-Module -Name $mn -RequiredVersion $target -Scope AllUsers -Force -AllowClobber -Repository PSGallery -ErrorAction Stop
-                RGL "$mn $target installed." "OK"
-            } catch { RGL "Failed to install $mn ${target}: $_" "ERR" }
+        if ($hasTarget) { RGL "$mn $target - already present." "OK"; continue }
+        try {
+            RGL "Installing $mn $target (AllUsers, side-by-side with any existing versions)..."
+            Install-Module -Name $mn -RequiredVersion $target -Scope AllUsers -Force -AllowClobber -Repository PSGallery -ErrorAction Stop
+            RGL "$mn $target installed." "OK"
+        } catch {
+            RGL "Failed to install $mn ${target}: $_" "ERR"
+            $target = $null
+            break
         }
     }
-    RGL "Graph module version-skew repair complete." "OK"
+
+    if ($target) {
+        $script:GraphModuleTargetVersion = $target
+        RGL "Pinned Graph module version for this run: $target" "OK"
+    } else {
+        RGL "No pinned version available - Import-Module calls will fall back to unpinned." "WARN"
+    }
 }
 
 # ============================================================
@@ -337,9 +337,14 @@ function Invoke-RoleBootstrap {
     }
 
     try {
-        $null = Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
-        $null = Import-Module Microsoft.Graph.Users -ErrorAction Stop
-        $null = Import-Module Microsoft.Graph.Identity.DirectoryManagement -ErrorAction Stop
+        # Pin an exact version when Repair-GraphModuleVersionSkew resolved one - see that
+        # function for why: avoids ambiguous Import-Module resolution across module paths
+        # entirely, rather than depending on old mismatched versions having been removed.
+        $verArgs = @{}
+        if ($script:GraphModuleTargetVersion) { $verArgs['RequiredVersion'] = $script:GraphModuleTargetVersion }
+        $null = Import-Module Microsoft.Graph.Authentication @verArgs -ErrorAction Stop
+        $null = Import-Module Microsoft.Graph.Users @verArgs -ErrorAction Stop
+        $null = Import-Module Microsoft.Graph.Identity.DirectoryManagement @verArgs -ErrorAction Stop
 
         $null = Connect-MgGraph -Scopes @("RoleManagement.ReadWrite.Directory", "User.Read.All", "Directory.Read.All") -NoWelcome -ErrorAction Stop
 
@@ -485,7 +490,9 @@ function Connect-ToGraph {
 
 function Connect-M365Graph {
     param([string[]]$FallbackScopes = @("User.ReadWrite.All", "AuditLog.Read.All", "Organization.Read.All", "Directory.Read.All"))
-    $null = Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
+    $verArgs = @{}
+    if ($script:GraphModuleTargetVersion) { $verArgs['RequiredVersion'] = $script:GraphModuleTargetVersion }
+    $null = Import-Module Microsoft.Graph.Authentication @verArgs -ErrorAction Stop
     $cfg = Get-CertConfig
     if ($cfg) {
         $ok = Connect-ToGraph
@@ -594,9 +601,11 @@ function Initialize-M365Auth {
 $ErrorActionPreference = "Stop"
 $result = [ordered]@{ Success = $false; AppId = ""; TenantId = ""; CertThumbprint = ""; ExchangeOrg = ""; ErrorMessage = "" }
 try {
-    Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
-    Import-Module Microsoft.Graph.Applications -ErrorAction Stop
-    Import-Module Microsoft.Graph.Identity.DirectoryManagement -ErrorAction Stop
+    $verArgs = @{}
+    if ($TargetGraphVersion) { $verArgs["RequiredVersion"] = $TargetGraphVersion }
+    Import-Module Microsoft.Graph.Authentication @verArgs -ErrorAction Stop
+    Import-Module Microsoft.Graph.Applications @verArgs -ErrorAction Stop
+    Import-Module Microsoft.Graph.Identity.DirectoryManagement @verArgs -ErrorAction Stop
 
     Write-Host "Connecting to Microsoft Graph - a sign-in window/browser should appear..." -ForegroundColor Cyan
     Connect-MgGraph -Scopes @(
@@ -736,6 +745,7 @@ try {
 
     $scriptBody = @"
 `$ErrorActionPreference = 'Stop'
+`$TargetGraphVersion = '$($script:GraphModuleTargetVersion)'
 
 $authCommands
 
