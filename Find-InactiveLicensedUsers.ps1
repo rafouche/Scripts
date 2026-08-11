@@ -599,7 +599,7 @@ function Initialize-M365Auth {
 
     $authCommands = @'
 $ErrorActionPreference = "Stop"
-$result = [ordered]@{ Success = $false; AppId = ""; TenantId = ""; CertThumbprint = ""; ExchangeOrg = ""; ErrorMessage = "" }
+$result = [ordered]@{ Success = $false; AppId = ""; TenantId = ""; CertThumbprint = ""; ExchangeOrg = ""; ErrorMessage = ""; Warnings = "" }
 try {
     $verArgs = @{}
     if ($TargetGraphVersion) { $verArgs["RequiredVersion"] = $TargetGraphVersion }
@@ -647,10 +647,10 @@ try {
     $graphRoles = @()
     foreach ($p in $graphPermNames) {
         $roleObj = $graphSP.AppRoles | Where-Object { $_.Value -eq $p } | Select-Object -First 1
-        if ($roleObj) { $graphRoles += @{ Id = [string]$roleObj.Id; Type = "Role" } }
+        if ($roleObj) { $graphRoles += @{ Name = $p; Id = [string]$roleObj.Id; Type = "Role" } }
         else { Write-Host "Graph app role not found: $p" -ForegroundColor Yellow }
     }
-    $reqAccess = @(@{ ResourceAppId = "00000003-0000-0000-c000-000000000000"; ResourceAccess = $graphRoles })
+    $reqAccess = @(@{ ResourceAppId = "00000003-0000-0000-c000-000000000000"; ResourceAccess = ($graphRoles | ForEach-Object { @{ Id = $_.Id; Type = $_.Type } }) })
 
     $exoRoleId = $null
     if ($exoSP) {
@@ -670,13 +670,45 @@ try {
     Write-Host "Waiting 15s for propagation, then granting admin consent..." -ForegroundColor Cyan
     Start-Sleep -Seconds 15
 
+    # New-MgServicePrincipalAppRoleAssignment can fail transiently right after the SP was
+    # just created (directory replication lag) even after the 15s wait above - retry each
+    # one instead of the previous silent "try { } catch {}" (which meant a failed grant here
+    # showed up later only as a confusing 403 Authorization_RequestDenied, with zero
+    # indication which permission was actually missing).
+    function Grant-AppRoleWithRetry {
+        param($ServicePrincipalId, $ResourceId, $AppRoleId, $Label)
+        for ($i = 1; $i -le 5; $i++) {
+            try {
+                New-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $ServicePrincipalId -PrincipalId $ServicePrincipalId -ResourceId $ResourceId -AppRoleId $AppRoleId | Out-Null
+                Write-Host "  Granted: $Label" -ForegroundColor Green
+                return $true
+            } catch {
+                if ($i -eq 5) {
+                    Write-Host "  FAILED to grant ${Label}: $_" -ForegroundColor Red
+                    return $false
+                }
+                Start-Sleep -Seconds 5
+            }
+        }
+    }
+
+    $roleGrantFailures = New-Object System.Collections.Generic.List[string]
     foreach ($role in $graphRoles) {
-        try { New-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $sp.Id -PrincipalId $sp.Id -ResourceId $graphSP.Id -AppRoleId $role.Id | Out-Null } catch {}
+        if (-not (Grant-AppRoleWithRetry -ServicePrincipalId $sp.Id -ResourceId $graphSP.Id -AppRoleId $role.Id -Label $role.Name)) {
+            $roleGrantFailures.Add($role.Name)
+        }
     }
     if ($exoSP -and $exoRoleId) {
-        try { New-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $sp.Id -PrincipalId $sp.Id -ResourceId $exoSP.Id -AppRoleId $exoRoleId | Out-Null } catch {}
+        if (-not (Grant-AppRoleWithRetry -ServicePrincipalId $sp.Id -ResourceId $exoSP.Id -AppRoleId $exoRoleId -Label "Exchange.ManageAsApp")) {
+            $roleGrantFailures.Add("Exchange.ManageAsApp")
+        }
     }
-    Write-Host "Admin consent granted." -ForegroundColor Green
+    if ($roleGrantFailures.Count -gt 0) {
+        $result.Warnings = "Could not grant: $($roleGrantFailures -join ', '). Fix in Entra admin center > Enterprise Applications > ADM365InactiveScanTool > Permissions, or just re-run Setup Auth."
+        Write-Host "WARNING: $($result.Warnings)" -ForegroundColor Yellow
+    } else {
+        Write-Host "Admin consent granted for all requested permissions." -ForegroundColor Green
+    }
 
     # Exchange.ManageAsApp additionally requires the SP to hold Exchange Administrator
     try {
@@ -793,6 +825,7 @@ Write-Host 'You may close this window now.' -ForegroundColor Cyan
     Save-Config
 
     Write-Log "Setup complete. App ID: $($r.AppId)  Cert: $($r.CertThumbprint)  Exchange Org: $($r.ExchangeOrg)" "SUCCESS" $LogBox
+    if ($r.Warnings) { Write-Log $r.Warnings "WARN" $LogBox }
     Write-Log "Wait 5-10 minutes before first use, and confirm Azure AD Premium P1/P2 is licensed in this tenant." "WARN" $LogBox
     return $true
 }
