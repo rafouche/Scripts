@@ -889,7 +889,12 @@ function Get-InactiveLicensedUsers {
     $allUsers = New-Object System.Collections.Generic.List[object]
     $sawSignInField = $false
     do {
-        $resp = Invoke-MgGraphRequest -Method GET -Uri $uri -ErrorAction Stop
+        # ConsistencyLevel: eventual is required for Graph to actually populate
+        # signInActivity on a LIST users query - without it, the request succeeds (200 OK,
+        # no error) but silently omits the field from every result instead of erroring,
+        # which is exactly what happened on the live test: 125/125 users came back with no
+        # signInActivity at all, confirmed-granted AuditLog.Read.All and P1 notwithstanding.
+        $resp = Invoke-MgGraphRequest -Method GET -Uri $uri -Headers @{ ConsistencyLevel = "eventual" } -ErrorAction Stop
         foreach ($u in $resp.value) {
             if ($u.PSObject.Properties['signInActivity']) { $sawSignInField = $true }
             $allUsers.Add($u)
