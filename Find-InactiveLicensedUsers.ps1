@@ -894,7 +894,11 @@ function Get-InactiveLicensedUsers {
             if ($u.PSObject.Properties['signInActivity']) { $sawSignInField = $true }
             $allUsers.Add($u)
         }
-        $uri = $resp.'@odata.nextLink'
+        # Set-StrictMode -Version Latest throws "property cannot be found" instead of
+        # returning $null for a missing property - and the response object simply won't
+        # have @odata.nextLink at all once there's no further page (not present-as-null,
+        # genuinely absent). Check existence first rather than accessing directly.
+        $uri = if ($resp.PSObject.Properties['@odata.nextLink']) { $resp.'@odata.nextLink' } else { $null }
     } while ($uri)
 
     Write-Log "Retrieved $($allUsers.Count) total user objects." "INFO" $LogBox
@@ -907,8 +911,19 @@ function Get-InactiveLicensedUsers {
         if ($u.userType -ne 'Member') { continue }
         if (-not $u.assignedLicenses -or $u.assignedLicenses.Count -eq 0) { continue }
 
-        $lastInteractive    = $u.signInActivity.lastSignInDateTime
-        $lastNonInteractive = $u.signInActivity.lastNonInteractiveSignInDateTime
+        # Same StrictMode issue as above: Graph omits signInActivity - and individually,
+        # its lastSignInDateTime / lastNonInteractiveSignInDateTime sub-fields - entirely
+        # (not null-valued, genuinely absent) for users with no recorded activity of that
+        # type. Exactly the accounts this tool exists to find, so check existence at every
+        # level rather than assuming the shape.
+        $lastInteractive = $null
+        $lastNonInteractive = $null
+        $signInProp = $u.PSObject.Properties['signInActivity']
+        if ($signInProp -and $signInProp.Value) {
+            $siProps = $signInProp.Value.PSObject.Properties
+            if ($siProps['lastSignInDateTime']) { $lastInteractive = $siProps['lastSignInDateTime'].Value }
+            if ($siProps['lastNonInteractiveSignInDateTime']) { $lastNonInteractive = $siProps['lastNonInteractiveSignInDateTime'].Value }
+        }
         $lastActivity = @($lastInteractive, $lastNonInteractive) |
             Where-Object { $_ } | ForEach-Object { [datetime]$_ } |
             Sort-Object -Descending | Select-Object -First 1
