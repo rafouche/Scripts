@@ -189,6 +189,7 @@ function Invoke-ModuleBootstrap {
             $c = switch ($l) { "OK" { "Green" } "WARN" { "Yellow" } "ERR" { "Red" } default { "Cyan" } }
             Write-Host "[$(Get-Date -Format 'HH:mm:ss')][$l] $m" -ForegroundColor $c
         }
+        if ($script:StartupLog) { $script:StartupLog.Add([PSCustomObject]@{ Level = $l; Message = $m }) }
     }
 
     BL "Checking required modules (running as: $($env:USERNAME))..."
@@ -254,6 +255,7 @@ function Repair-GraphModuleVersionSkew {
             $c = switch ($l) { "OK" { "Green" } "WARN" { "Yellow" } "ERR" { "Red" } default { "Cyan" } }
             Write-Host "[$(Get-Date -Format 'HH:mm:ss')][$l] $m" -ForegroundColor $c
         }
+        if ($script:StartupLog) { $script:StartupLog.Add([PSCustomObject]@{ Level = $l; Message = $m }) }
     }
 
     $graphModules = @("Microsoft.Graph.Authentication", "Microsoft.Graph.Users", "Microsoft.Graph.Applications", "Microsoft.Graph.Identity.DirectoryManagement")
@@ -322,6 +324,7 @@ function Invoke-RoleBootstrap {
             $c = switch ($l) { "OK" { "Green" } "WARN" { "Yellow" } "ERR" { "Red" } default { "Cyan" } }
             Write-Host "[$(Get-Date -Format 'HH:mm:ss')][$l] $m" -ForegroundColor $c
         }
+        if ($script:StartupLog) { $script:StartupLog.Add([PSCustomObject]@{ Level = $l; Message = $m }) }
     }
 
     $requiredRoles = @("Exchange Administrator", "User Administrator", "License Administrator")
@@ -394,6 +397,11 @@ function Invoke-RoleBootstrap {
 # ============================================================
 
 $isSilent = $ReportOnly.IsPresent
+# Startup runs (module bootstrap, Graph version-skew repair, role bootstrap) all happen
+# before the GUI window exists, so their Write-Host output only ever reached whatever
+# console launched the script - easy to miss, and useless for after-the-fact diagnosis.
+# Buffer it here and replay it into the GUI log box once that exists (see SECTION 5).
+$script:StartupLog = New-Object System.Collections.Generic.List[object]
 
 Write-Host "[$(Get-Date -Format 'HH:mm:ss')][INFO] Entra ID Inactive Licensed User Scanner - v1.0" -ForegroundColor Magenta
 
@@ -1105,6 +1113,15 @@ $logBox.Location = New-Object System.Drawing.Point(16, 546); $logBox.Size = New-
 $logBox.Anchor = "Bottom,Left,Right"
 $logBox.Font = $F_MONO; $logBox.BackColor = [System.Drawing.Color]::FromArgb(10, 14, 22)
 $logBox.ForeColor = $TEXT; $logBox.ReadOnly = $true; $logBox.BorderStyle = "None"; $logBox.ScrollBars = "Vertical"
+
+if ($script:StartupLog -and $script:StartupLog.Count -gt 0) {
+    Write-Log "--- Startup log (module bootstrap / Graph version-skew repair / role check) ---" "INFO" $logBox
+    foreach ($entry in $script:StartupLog) {
+        $mappedLevel = switch ($entry.Level) { "OK" { "SUCCESS" } "ERR" { "ERROR" } "WARN" { "WARN" } default { "INFO" } }
+        Write-Log $entry.Message $mappedLevel $logBox
+    }
+    Write-Log "--- End startup log ---" "INFO" $logBox
+}
 
 $pnlBot = New-Object System.Windows.Forms.Panel
 $pnlBot.Anchor = "Bottom,Left,Right"; $pnlBot.Location = New-Object System.Drawing.Point(0, 684); $pnlBot.Size = New-Object System.Drawing.Size(1180, 54)
