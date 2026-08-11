@@ -607,137 +607,204 @@ function Connect-ToGraph {
 # so all three tools can reuse the same non-interactive credential.
 # ---------------------------------------------------------------
 function Initialize-M365Auth {
-    Write-Log 'Starting one-time non-interactive auth setup...' 'INFO'
-    Write-Log 'Sign in with a GLOBAL ADMIN account when prompted.' 'WARN'
+    # Runs entirely in an isolated child pwsh.exe process. The Microsoft.Graph PowerShell
+    # SDK ships each Microsoft.Graph.* submodule with its OWN private copy of
+    # Microsoft.Graph.Authentication.dll; importing several submodules across different
+    # stages of one long-lived session (Role Bootstrap already connected to Graph at
+    # startup) throws "Assembly with same name is already loaded" the moment this function
+    # imports Applications/Identity.DirectoryManagement on top of that. A fresh process has
+    # no assemblies loaded yet, so it can never collide - same isolation trick already used
+    # for EXO operations in the sibling Onboard/Offboard tools, just for the app-reg flow.
+    Write-Log 'Launching auth setup in an isolated PowerShell window (avoids a known Microsoft.Graph module assembly conflict with this session)...' 'INFO'
+    Write-Log 'A new console window will open. Sign in with a GLOBAL ADMIN account when prompted, then return here.' 'WARN'
+
+    $uid        = [System.Guid]::NewGuid().ToString('N').Substring(0, 10)
+    $scriptFile = Join-Path $env:TEMP "setupauth_s_$uid.ps1"
+    $resultFile = Join-Path $env:TEMP "setupauth_r_$uid.json"
+
+    $authCommands = @'
+$ErrorActionPreference = "Stop"
+$result = [ordered]@{ Success = $false; AppId = ""; TenantId = ""; CertThumbprint = ""; ExchangeOrg = ""; ErrorMessage = "" }
+try {
+    Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
+    Import-Module Microsoft.Graph.Applications -ErrorAction Stop
+    Import-Module Microsoft.Graph.Identity.DirectoryManagement -ErrorAction Stop
+
+    Write-Host "Connecting to Microsoft Graph - a sign-in window/browser should appear..." -ForegroundColor Cyan
+    Connect-MgGraph -Scopes @(
+        "Application.ReadWrite.All", "AppRoleAssignment.ReadWrite.All",
+        "RoleManagement.ReadWrite.Directory", "Directory.ReadWrite.All", "Organization.Read.All"
+    ) -NoWelcome -ErrorAction Stop
+
+    $ctx = Get-MgContext
+    $tenantId = $ctx.TenantId
+    Write-Host "Connected. Tenant: $tenantId" -ForegroundColor Green
+
+    Write-Host "Creating authentication certificate..." -ForegroundColor Cyan
+    $appName = "ADM365LifecycleTool"
+    $cert = New-SelfSignedCertificate -Subject "CN=$appName" `
+        -CertStoreLocation "Cert:\LocalMachine\My" `
+        -KeyExportPolicy NonExportable -KeySpec Signature `
+        -KeyLength 2048 -KeyAlgorithm RSA -HashAlgorithm SHA256 `
+        -NotAfter (Get-Date).AddYears(2)
+    Write-Host "Certificate: $($cert.Thumbprint)" -ForegroundColor Green
+
+    $old = Get-MgApplication -Filter "displayName eq '$appName'" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($old) { Remove-MgApplication -ApplicationId $old.Id; Write-Host "Removed existing app." -ForegroundColor Yellow }
+
+    Write-Host "Creating Entra ID app registration..." -ForegroundColor Cyan
+    $app = New-MgApplication -DisplayName $appName -SignInAudience "AzureADMyOrg"
+    Write-Host "App created: $($app.AppId)" -ForegroundColor Green
+
+    Update-MgApplication -ApplicationId $app.Id -KeyCredentials @(@{
+        Type = "AsymmetricX509Cert"; Usage = "Verify"; Key = $cert.RawData; DisplayName = "$appName Cert"
+    }) | Out-Null
+    Write-Host "Certificate uploaded to app." -ForegroundColor Green
+
+    $graphSP = Get-MgServicePrincipal -Filter "appId eq '00000003-0000-0000-c000-000000000000'"
+    $exoSP   = Get-MgServicePrincipal -Filter "appId eq '00000002-0000-0ff1-ce00-000000000000'" -ErrorAction SilentlyContinue
+    $spoSP   = Get-MgServicePrincipal -Filter "appId eq '00000003-0000-0ff1-ce00-000000000000'" -ErrorAction SilentlyContinue
+
+    $graphPermNames = @("User.ReadWrite.All","Group.ReadWrite.All","Directory.ReadWrite.All","Organization.Read.All","RoleManagement.ReadWrite.Directory")
+    $graphRoles = @()
+    foreach ($p in $graphPermNames) {
+        $roleObj = $graphSP.AppRoles | Where-Object { $_.Value -eq $p } | Select-Object -First 1
+        if ($roleObj) { $graphRoles += @{ Id = [string]$roleObj.Id; Type = "Role" } }
+    }
+    $reqAccess = @(@{ ResourceAppId = "00000003-0000-0000-c000-000000000000"; ResourceAccess = $graphRoles })
+
+    $exoRoleId = $null
+    if ($exoSP) {
+        $er = $exoSP.AppRoles | Where-Object { $_.Value -eq "Exchange.ManageAsApp" } | Select-Object -First 1
+        if ($er) {
+            $exoRoleId = [string]$er.Id
+            $reqAccess += @{ ResourceAppId = "00000002-0000-0ff1-ce00-000000000000"; ResourceAccess = @(@{ Id = $exoRoleId; Type = "Role" }) }
+        }
+    }
+
+    $spoRoleId = $null
+    if ($spoSP) {
+        $sr = $spoSP.AppRoles | Where-Object { $_.Value -eq "Sites.FullControl.All" } | Select-Object -First 1
+        if ($sr) {
+            $spoRoleId = [string]$sr.Id
+            $reqAccess += @{ ResourceAppId = "00000003-0000-0ff1-ce00-000000000000"; ResourceAccess = @(@{ Id = $spoRoleId; Type = "Role" }) }
+        }
+    }
+
+    Update-MgApplication -ApplicationId $app.Id -RequiredResourceAccess $reqAccess | Out-Null
+    Write-Host "Permissions configured." -ForegroundColor Green
+
+    Write-Host "Creating service principal..." -ForegroundColor Cyan
+    $sp = New-MgServicePrincipal -AppId $app.AppId
+
+    Write-Host "Waiting 15s for propagation, then granting admin consent..." -ForegroundColor Cyan
+    Start-Sleep -Seconds 15
+
+    foreach ($role in $graphRoles) {
+        try { New-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $sp.Id -PrincipalId $sp.Id -ResourceId $graphSP.Id -AppRoleId $role.Id | Out-Null } catch {}
+    }
+    if ($exoSP -and $exoRoleId) {
+        try { New-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $sp.Id -PrincipalId $sp.Id -ResourceId $exoSP.Id -AppRoleId $exoRoleId | Out-Null } catch {}
+    }
+    if ($spoSP -and $spoRoleId) {
+        try { New-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $sp.Id -PrincipalId $sp.Id -ResourceId $spoSP.Id -AppRoleId $spoRoleId | Out-Null } catch {}
+    }
+    Write-Host "Admin consent granted." -ForegroundColor Green
 
     try {
-        $null = Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
-        $null = Import-Module Microsoft.Graph.Applications -ErrorAction Stop
-        $null = Import-Module Microsoft.Graph.Identity.DirectoryManagement -ErrorAction Stop
-
-        $null = Connect-MgGraph -Scopes @(
-            'Application.ReadWrite.All', 'AppRoleAssignment.ReadWrite.All',
-            'RoleManagement.ReadWrite.Directory', 'Directory.ReadWrite.All', 'Organization.Read.All'
-        ) -NoWelcome -ErrorAction Stop
-
-        $ctx      = Get-MgContext
-        $tenantId = $ctx.TenantId
-        Write-Log "Connected. Tenant: $tenantId" 'OK'
-
-        Write-Log 'Creating authentication certificate...' 'INFO'
-        $appName = 'ADM365LifecycleTool'
-        $cert = New-SelfSignedCertificate -Subject "CN=$appName" `
-            -CertStoreLocation 'Cert:\LocalMachine\My' `
-            -KeyExportPolicy NonExportable -KeySpec Signature `
-            -KeyLength 2048 -KeyAlgorithm RSA -HashAlgorithm SHA256 `
-            -NotAfter (Get-Date).AddYears(2)
-        Write-Log "Certificate: $($cert.Thumbprint)" 'OK'
-
-        $old = Get-MgApplication -Filter "displayName eq '$appName'" -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($old) { Remove-MgApplication -ApplicationId $old.Id; Write-Log 'Removed existing app.' 'WARN' }
-
-        Write-Log 'Creating Entra ID app registration...' 'INFO'
-        $app = New-MgApplication -DisplayName $appName -SignInAudience 'AzureADMyOrg'
-        Write-Log "App created: $($app.AppId)" 'OK'
-
-        $null = Update-MgApplication -ApplicationId $app.Id -KeyCredentials @(@{
-            Type        = 'AsymmetricX509Cert'
-            Usage       = 'Verify'
-            Key         = $cert.RawData
-            DisplayName = "$appName Cert"
-        })
-        Write-Log 'Certificate uploaded to app.' 'OK'
-
-        $graphSP = Get-MgServicePrincipal -Filter "appId eq '00000003-0000-0000-c000-000000000000'"
-        $exoSP   = Get-MgServicePrincipal -Filter "appId eq '00000002-0000-0ff1-ce00-000000000000'" -ErrorAction SilentlyContinue
-        $spoSP   = Get-MgServicePrincipal -Filter "appId eq '00000003-0000-0ff1-ce00-000000000000'" -ErrorAction SilentlyContinue
-
-        $graphPermNames = @('User.ReadWrite.All','Group.ReadWrite.All','Directory.ReadWrite.All','Organization.Read.All','RoleManagement.ReadWrite.Directory')
-        $graphRoles = @()
-        foreach ($p in $graphPermNames) {
-            $r = $graphSP.AppRoles | Where-Object { $_.Value -eq $p } | Select-Object -First 1
-            if ($r) { $graphRoles += @{ Id = [string]$r.Id; Type = 'Role' } }
+        $exoAdmRole = Get-MgDirectoryRole -Filter "displayName eq 'Exchange Administrator'" -ErrorAction SilentlyContinue
+        if (-not $exoAdmRole) {
+            $t = Get-MgDirectoryRoleTemplate | Where-Object { $_.DisplayName -eq "Exchange Administrator" } | Select-Object -First 1
+            $exoAdmRole = New-MgDirectoryRole -RoleTemplateId $t.Id
         }
-        $reqAccess = @(@{ ResourceAppId = '00000003-0000-0000-c000-000000000000'; ResourceAccess = $graphRoles })
+        New-MgDirectoryRoleMemberByRef -DirectoryRoleId $exoAdmRole.Id -BodyParameter @{
+            "@odata.id" = "https://graph.microsoft.com/v1.0/directoryObjects/$($sp.Id)"
+        } | Out-Null
+        Write-Host "Exchange Administrator role assigned to service principal." -ForegroundColor Green
+    } catch { Write-Host "Exchange role assignment warning: $_" -ForegroundColor Yellow }
 
-        $exoRoleId = $null
-        if ($exoSP) {
-            $er = $exoSP.AppRoles | Where-Object { $_.Value -eq 'Exchange.ManageAsApp' } | Select-Object -First 1
-            if ($er) {
-                $exoRoleId = [string]$er.Id
-                $reqAccess += @{ ResourceAppId = '00000002-0000-0ff1-ce00-000000000000'; ResourceAccess = @(@{ Id = $exoRoleId; Type = 'Role' }) }
-            }
-        }
+    $org = Get-MgOrganization | Select-Object -First 1
+    $exoOrg = ($org.VerifiedDomains | Where-Object { $_.IsInitial -eq $true } | Select-Object -First 1).Name
+    if (-not $exoOrg) { Write-Host "Could not determine initial .onmicrosoft.com domain -- ExchangeOrg left blank." -ForegroundColor Yellow }
 
-        $spoRoleId = $null
-        if ($spoSP) {
-            $sr = $spoSP.AppRoles | Where-Object { $_.Value -eq 'Sites.FullControl.All' } | Select-Object -First 1
-            if ($sr) {
-                $spoRoleId = [string]$sr.Id
-                $reqAccess += @{ ResourceAppId = '00000003-0000-0ff1-ce00-000000000000'; ResourceAccess = @(@{ Id = $spoRoleId; Type = 'Role' }) }
-            }
-        }
+    $result.Success       = $true
+    $result.AppId          = $app.AppId
+    $result.TenantId       = $tenantId
+    $result.CertThumbprint = $cert.Thumbprint
+    $result.ExchangeOrg    = $exoOrg
 
-        $null = Update-MgApplication -ApplicationId $app.Id -RequiredResourceAccess $reqAccess
-        Write-Log 'Permissions configured.' 'OK'
+    Disconnect-MgGraph -ErrorAction SilentlyContinue
 
-        Write-Log 'Creating service principal...' 'INFO'
-        $sp = New-MgServicePrincipal -AppId $app.AppId
-
-        Write-Log 'Waiting 15s for propagation, then granting admin consent...' 'INFO'
-        Start-Sleep -Seconds 15
-
-        foreach ($role in $graphRoles) {
-            try { $null = New-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $sp.Id -PrincipalId $sp.Id -ResourceId $graphSP.Id -AppRoleId $role.Id } catch {}
-        }
-        if ($exoSP -and $exoRoleId) {
-            try { $null = New-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $sp.Id -PrincipalId $sp.Id -ResourceId $exoSP.Id -AppRoleId $exoRoleId } catch {}
-        }
-        if ($spoSP -and $spoRoleId) {
-            try { $null = New-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $sp.Id -PrincipalId $sp.Id -ResourceId $spoSP.Id -AppRoleId $spoRoleId } catch {}
-        }
-        Write-Log 'Admin consent granted.' 'OK'
-
-        try {
-            $exoAdmRole = Get-MgDirectoryRole -Filter "displayName eq 'Exchange Administrator'" -ErrorAction SilentlyContinue
-            if (-not $exoAdmRole) {
-                $t = Get-MgDirectoryRoleTemplate | Where-Object { $_.DisplayName -eq 'Exchange Administrator' } | Select-Object -First 1
-                $exoAdmRole = New-MgDirectoryRole -RoleTemplateId $t.Id
-            }
-            $null = New-MgDirectoryRoleMemberByRef -DirectoryRoleId $exoAdmRole.Id `
-                -BodyParameter @{ '@odata.id' = "https://graph.microsoft.com/v1.0/directoryObjects/$($sp.Id)" }
-            Write-Log 'Exchange Administrator role assigned to service principal.' 'OK'
-        } catch { Write-Log "Exchange role assignment warning: $_" 'WARN' }
-
-        $org = Get-MgOrganization | Select-Object -First 1
-        $exoOrg = ($org.VerifiedDomains | Where-Object { $_.IsInitial -eq $true } | Select-Object -First 1).Name
-        if (-not $exoOrg) { Write-Log 'Could not determine initial .onmicrosoft.com domain -- ExchangeOrg left blank.' 'WARN' }
-
-        $script:Config['AppId']          = $app.AppId
-        $script:Config['TenantId']       = $tenantId
-        $script:Config['CertThumbprint'] = $cert.Thumbprint
-        $script:Config['ExchangeOrg']    = $exoOrg
-        Save-Config
-
-        $null = Disconnect-MgGraph -ErrorAction SilentlyContinue
-
-        Write-Log '============================================' 'OK'
-        Write-Log ' SETUP COMPLETE - non-interactive auth ready' 'OK'
-        Write-Log " App ID      : $($app.AppId)" 'OK'
-        Write-Log " Cert        : $($cert.Thumbprint)" 'OK'
-        Write-Log " Exchange Org: $exoOrg" 'OK'
-        Write-Log ' Wait 5-10 minutes before first use.' 'WARN'
-        Write-Log '============================================' 'OK'
-        return $true
+    Write-Host "============================================" -ForegroundColor Green
+    Write-Host " SETUP COMPLETE - non-interactive auth ready" -ForegroundColor Green
+    Write-Host " App ID      : $($app.AppId)" -ForegroundColor Green
+    Write-Host " Cert        : $($cert.Thumbprint)" -ForegroundColor Green
+    Write-Host " Exchange Org: $exoOrg" -ForegroundColor Green
+    Write-Host " Wait 5-10 minutes before first use." -ForegroundColor Yellow
+    Write-Host "============================================" -ForegroundColor Green
+} catch {
+    try {
+        $result.ErrorMessage = if ($_.Exception -and $_.Exception.Message) { $_.Exception.Message } else { "$_" }
+    } catch { $result.ErrorMessage = "Unknown error (failed to read exception details)." }
+    Write-Host "[ERROR] Setup failed: $($result.ErrorMessage)" -ForegroundColor Red
+    if ((Test-Path variable:cert) -and $cert) {
+        try { Remove-Item "Cert:\LocalMachine\My\$($cert.Thumbprint)" -DeleteKey -ErrorAction SilentlyContinue } catch {}
     }
-    catch {
-        Write-Log "Setup error: $(Get-SafeErrorText $_)" 'ERR'
-        if ((Test-Path variable:cert) -and $cert) {
-            try { Remove-Item "Cert:\LocalMachine\My\$($cert.Thumbprint)" -DeleteKey -ErrorAction SilentlyContinue } catch {}
-        }
-        try { $null = Disconnect-MgGraph -ErrorAction SilentlyContinue } catch {}
+    try { Disconnect-MgGraph -ErrorAction SilentlyContinue } catch {}
+}
+'@
+
+    $scriptBody = @"
+`$ErrorActionPreference = 'Stop'
+
+$authCommands
+
+(`$result | ConvertTo-Json) | Set-Content '$($resultFile -replace "'","''")' -Encoding UTF8
+Write-Host ''
+Write-Host 'You may close this window now.' -ForegroundColor Cyan
+"@
+    $scriptBody | Set-Content $scriptFile -Encoding UTF8
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $exeShell = if ($PSVersionTable.PSEdition -eq 'Core') { 'pwsh.exe' } else { 'powershell.exe' }
+    $psi.FileName        = $exeShell
+    $psi.Arguments       = "-NoProfile -ExecutionPolicy Bypass -File `"$scriptFile`""
+    $psi.UseShellExecute = $true
+    $psi.WindowStyle     = [System.Diagnostics.ProcessWindowStyle]::Normal
+
+    try {
+        $proc = [System.Diagnostics.Process]::Start($psi)
+        $proc.WaitForExit()
+    } catch {
+        Write-Log "Could not launch setup process: $(Get-SafeErrorText $_)" 'ERR'
+        Remove-Item $scriptFile -Force -ErrorAction SilentlyContinue
         return $false
     }
+
+    if (-not (Test-Path $resultFile)) {
+        Write-Log 'Setup Auth window closed without producing a result - it may have been closed early, or sign-in was cancelled.' 'ERR'
+        Remove-Item $scriptFile -Force -ErrorAction SilentlyContinue
+        return $false
+    }
+
+    $r = Get-Content $resultFile -Raw | ConvertFrom-Json
+    Remove-Item $resultFile -Force -ErrorAction SilentlyContinue
+    Remove-Item $scriptFile -Force -ErrorAction SilentlyContinue
+
+    if (-not $r.Success) {
+        Write-Log "Setup Auth failed: $($r.ErrorMessage)" 'ERR'
+        return $false
+    }
+
+    $script:Config['AppId']          = $r.AppId
+    $script:Config['TenantId']       = $r.TenantId
+    $script:Config['CertThumbprint'] = $r.CertThumbprint
+    $script:Config['ExchangeOrg']    = $r.ExchangeOrg
+    Save-Config
+
+    Write-Log "Setup complete. App ID: $($r.AppId)  Cert: $($r.CertThumbprint)  Exchange Org: $($r.ExchangeOrg)" 'OK'
+    Write-Log 'Wait 5-10 minutes before first use.' 'WARN'
+    return $true
 }
 
 # ---------------------------------------------------------------
