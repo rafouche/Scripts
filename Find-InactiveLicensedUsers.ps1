@@ -880,60 +880,48 @@ function Get-InactiveLicensedUsers {
     )
 
     Connect-M365Graph -LogBox $LogBox
+
+    $verArgs = @{}
+    if ($script:GraphModuleTargetVersion) { $verArgs['RequiredVersion'] = $script:GraphModuleTargetVersion }
+    Import-Module Microsoft.Graph.Users @verArgs -ErrorAction Stop
+
     $cutoff = (Get-Date).ToUniversalTime().AddDays(-$InactiveDays)
 
     Write-Log "Retrieving licensed users (this can take a while on large tenants)..." "INFO" $LogBox
-    $select = "id,displayName,userPrincipalName,mail,accountEnabled,assignedLicenses,onPremisesSyncEnabled,createdDateTime,userType,signInActivity"
-    $uri = "https://graph.microsoft.com/v1.0/users?`$select=$select&`$top=999"
 
-    $allUsers = New-Object System.Collections.Generic.List[object]
-    $sawSignInField = $false
-    do {
-        # ConsistencyLevel: eventual is required for Graph to actually populate
-        # signInActivity on a LIST users query - without it, the request succeeds (200 OK,
-        # no error) but silently omits the field from every result instead of erroring,
-        # which is exactly what happened on the live test: 125/125 users came back with no
-        # signInActivity at all, confirmed-granted AuditLog.Read.All and P1 notwithstanding.
-        $resp = Invoke-MgGraphRequest -Method GET -Uri $uri -Headers @{ ConsistencyLevel = "eventual" } -ErrorAction Stop
-        foreach ($u in $resp.value) {
-            if ($u.PSObject.Properties['signInActivity']) { $sawSignInField = $true }
-            $allUsers.Add($u)
-        }
-        # Set-StrictMode -Version Latest throws "property cannot be found" instead of
-        # returning $null for a missing property - and the response object simply won't
-        # have @odata.nextLink at all once there's no further page (not present-as-null,
-        # genuinely absent). Check existence first rather than accessing directly.
-        $uri = if ($resp.PSObject.Properties['@odata.nextLink']) { $resp.'@odata.nextLink' } else { $null }
-    } while ($uri)
+    # Switched from a raw Invoke-MgGraphRequest GET + manual ConsistencyLevel header to the
+    # Get-MgUser cmdlet's own -ConsistencyLevel parameter - Microsoft's actual documented,
+    # SDK-native pattern for this exact scenario. The manual-header version came back with
+    # signInActivity silently omitted for every single user in a live test (confirmed-granted
+    # AuditLog.Read.All and Azure AD Premium P1 notwithstanding, so not a permissions gap) -
+    # something about the raw REST call wasn't triggering Graph's eventual-consistency path
+    # correctly. -All handles pagination internally, so no manual @odata.nextLink loop needed.
+    $allUsers = Get-MgUser -All -ConsistencyLevel eventual `
+        -Property Id, DisplayName, UserPrincipalName, Mail, AccountEnabled, AssignedLicenses, OnPremisesSyncEnabled, CreatedDateTime, UserType, SignInActivity `
+        -ErrorAction Stop
 
     Write-Log "Retrieved $($allUsers.Count) total user objects." "INFO" $LogBox
+    $sawSignInField = @($allUsers | Where-Object { $_.SignInActivity }).Count -gt 0
     if (-not $sawSignInField) {
-        Write-Log "signInActivity was not returned by Graph - falling back to account-creation-date heuristic only. Check that AuditLog.Read.All is consented and this tenant has Azure AD Premium P1/P2." "WARN" $LogBox
+        Write-Log "signInActivity still came back empty via Get-MgUser -ConsistencyLevel eventual - falling back to account-creation-date heuristic only. This now points at something tenant-level rather than a scripting issue - re-verify AuditLog.Read.All and Azure AD Premium P1/P2 directly against a user known to be active." "WARN" $LogBox
     }
 
     $results = New-Object System.Collections.Generic.List[object]
     foreach ($u in $allUsers) {
-        if ($u.userType -ne 'Member') { continue }
-        if (-not $u.assignedLicenses -or $u.assignedLicenses.Count -eq 0) { continue }
+        if ($u.UserType -ne 'Member') { continue }
+        if (-not $u.AssignedLicenses -or $u.AssignedLicenses.Count -eq 0) { continue }
 
-        # Same StrictMode issue as above: Graph omits signInActivity - and individually,
-        # its lastSignInDateTime / lastNonInteractiveSignInDateTime sub-fields - entirely
-        # (not null-valued, genuinely absent) for users with no recorded activity of that
-        # type. Exactly the accounts this tool exists to find, so check existence at every
-        # level rather than assuming the shape.
         $lastInteractive = $null
         $lastNonInteractive = $null
-        $signInProp = $u.PSObject.Properties['signInActivity']
-        if ($signInProp -and $signInProp.Value) {
-            $siProps = $signInProp.Value.PSObject.Properties
-            if ($siProps['lastSignInDateTime']) { $lastInteractive = $siProps['lastSignInDateTime'].Value }
-            if ($siProps['lastNonInteractiveSignInDateTime']) { $lastNonInteractive = $siProps['lastNonInteractiveSignInDateTime'].Value }
+        if ($u.SignInActivity) {
+            $lastInteractive    = $u.SignInActivity.LastSignInDateTime
+            $lastNonInteractive = $u.SignInActivity.LastNonInteractiveSignInDateTime
         }
         $lastActivity = @($lastInteractive, $lastNonInteractive) |
             Where-Object { $_ } | ForEach-Object { [datetime]$_ } |
             Sort-Object -Descending | Select-Object -First 1
 
-        $created = if ($u.createdDateTime) { [datetime]$u.createdDateTime } else { $null }
+        $created = if ($u.CreatedDateTime) { [datetime]$u.CreatedDateTime } else { $null }
 
         $isInactive = $false
         if ($lastActivity) {
@@ -948,16 +936,16 @@ function Get-InactiveLicensedUsers {
 
         $results.Add([PSCustomObject]@{
             Select            = $false
-            Id                = $u.id
-            DisplayName       = $u.displayName
-            UserPrincipalName = $u.userPrincipalName
-            Mail              = $u.mail
-            AccountEnabled    = [bool]$u.accountEnabled
-            Synced            = [bool]$u.onPremisesSyncEnabled
+            Id                = $u.Id
+            DisplayName       = $u.DisplayName
+            UserPrincipalName = $u.UserPrincipalName
+            Mail              = $u.Mail
+            AccountEnabled    = [bool]$u.AccountEnabled
+            Synced            = [bool]$u.OnPremisesSyncEnabled
             LastActivity      = $lastActivity
             DaysInactive      = $daysInactive
-            LicenseCount      = $u.assignedLicenses.Count
-            SkuIds            = @($u.assignedLicenses | ForEach-Object { $_.skuId })
+            LicenseCount      = $u.AssignedLicenses.Count
+            SkuIds            = @($u.AssignedLicenses | ForEach-Object { $_.SkuId.ToString() })
         })
     }
 
