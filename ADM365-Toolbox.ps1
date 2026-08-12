@@ -4329,7 +4329,456 @@ function Show-HardMatchPage {
 
     [void]$form.ShowDialog($Owner)
 }
-function Show-ScanPage       { param($Owner) Write-Log "Scan page not yet implemented in the combined toolbox - use Find-InactiveLicensedUsers.ps1 directly for now." "WARN" $script:launcherLog }
+
+function Get-InactiveLicensedUsers {
+    param(
+        [int]$InactiveDays,
+        [System.Windows.Forms.RichTextBox]$LogBox = $null
+    )
+
+    Connect-M365Graph -LogBox $LogBox
+
+    $verArgs = @{}
+    if ($script:GraphModuleTargetVersion) { $verArgs['RequiredVersion'] = $script:GraphModuleTargetVersion }
+    Import-Module Microsoft.Graph.Users @verArgs -ErrorAction Stop
+
+    $cutoff = (Get-Date).ToUniversalTime().AddDays(-$InactiveDays)
+
+    Write-Log "Retrieving licensed users (this can take a while on large tenants)..." "INFO" $LogBox
+
+    # Switched from a raw Invoke-MgGraphRequest GET + manual ConsistencyLevel header to the
+    # Get-MgUser cmdlet's own -ConsistencyLevel parameter - Microsoft's actual documented,
+    # SDK-native pattern for this exact scenario. The manual-header version came back with
+    # signInActivity silently omitted for every single user in a live test (confirmed-granted
+    # AuditLog.Read.All and Azure AD Premium P1 notwithstanding, so not a permissions gap) -
+    # something about the raw REST call wasn't triggering Graph's eventual-consistency path
+    # correctly. -All handles pagination internally, so no manual @odata.nextLink loop needed.
+    $allUsers = Get-MgUser -All -ConsistencyLevel eventual `
+        -Property Id, DisplayName, UserPrincipalName, Mail, AccountEnabled, AssignedLicenses, OnPremisesSyncEnabled, CreatedDateTime, UserType, SignInActivity `
+        -ErrorAction Stop
+
+    Write-Log "Retrieved $($allUsers.Count) total user objects." "INFO" $LogBox
+    $sawSignInField = @($allUsers | Where-Object { $_.SignInActivity }).Count -gt 0
+    if (-not $sawSignInField) {
+        Write-Log "signInActivity still came back empty via Get-MgUser -ConsistencyLevel eventual - falling back to account-creation-date heuristic only. This now points at something tenant-level rather than a scripting issue - re-verify AuditLog.Read.All and Azure AD Premium P1/P2 directly against a user known to be active." "WARN" $LogBox
+    }
+
+    $results = New-Object System.Collections.Generic.List[object]
+    foreach ($u in $allUsers) {
+        if ($u.UserType -ne 'Member') { continue }
+        if (-not $u.AssignedLicenses -or $u.AssignedLicenses.Count -eq 0) { continue }
+
+        $lastInteractive = $null
+        $lastNonInteractive = $null
+        if ($u.SignInActivity) {
+            $lastInteractive    = $u.SignInActivity.LastSignInDateTime
+            $lastNonInteractive = $u.SignInActivity.LastNonInteractiveSignInDateTime
+        }
+        $lastActivity = @($lastInteractive, $lastNonInteractive) |
+            Where-Object { $_ } | ForEach-Object { [datetime]$_ } |
+            Sort-Object -Descending | Select-Object -First 1
+
+        $created = if ($u.CreatedDateTime) { [datetime]$u.CreatedDateTime } else { $null }
+
+        $isInactive = $false
+        if ($lastActivity) {
+            $isInactive = $lastActivity -lt $cutoff
+        } elseif ($created) {
+            $isInactive = $created -lt $cutoff
+        }
+        if (-not $isInactive) { continue }
+
+        $refDate = if ($lastActivity) { $lastActivity } elseif ($created) { $created } else { $null }
+        $daysInactive = if ($refDate) { [math]::Round(((Get-Date).ToUniversalTime() - $refDate).TotalDays) } else { -1 }
+
+        $results.Add([PSCustomObject]@{
+            Select            = $false
+            Id                = $u.Id
+            DisplayName       = $u.DisplayName
+            UserPrincipalName = $u.UserPrincipalName
+            Mail              = $u.Mail
+            AccountEnabled    = [bool]$u.AccountEnabled
+            Synced            = [bool]$u.OnPremisesSyncEnabled
+            LastActivity      = $lastActivity
+            DaysInactive      = $daysInactive
+            LicenseCount      = $u.AssignedLicenses.Count
+            SkuIds            = @($u.AssignedLicenses | ForEach-Object { $_.SkuId.ToString() })
+        })
+    }
+
+    Write-Log "$($results.Count) licensed member account(s) inactive $InactiveDays+ days." "SUCCESS" $LogBox
+    return $results
+}
+
+function Export-ScanReport {
+    param($Candidates, [string]$Path)
+    $Candidates | Select-Object DisplayName, UserPrincipalName, Mail, AccountEnabled, Synced,
+        @{N='LastActivityUTC';E={ if ($_.LastActivity) { $_.LastActivity.ToString('u') } else { '(never recorded)' } }},
+        DaysInactive, LicenseCount |
+        Export-Csv -Path $Path -NoTypeInformation -Encoding UTF8
+}
+
+# ============================================================
+# SECTION 3 - REMEDIATION ENGINE
+# ============================================================
+
+function Invoke-UserRemediation {
+    param(
+        $Candidate,
+        [bool]$WhatIfMode,
+        [System.Windows.Forms.RichTextBox]$LogBox = $null
+    )
+
+    $result = [PSCustomObject]@{
+        UserPrincipalName = $Candidate.UserPrincipalName
+        MailboxConverted  = $false
+        Renamed           = $false
+        LicensesRemoved   = $false
+        Error             = ""
+    }
+
+    function Step { param([string]$d, [scriptblock]$a)
+        if ($WhatIfMode) { Write-Log "  [WHATIF] $d" "WARN" $LogBox }
+        else             { Write-Log "  $d" "INFO" $LogBox; & $a }
+    }
+
+    $upn        = $Candidate.UserPrincipalName
+    $origMail   = $Candidate.Mail
+    $upnLocal   = $upn.Split("@")[0]
+    $upnDomain  = $upn.Split("@")[1]
+    $mailLocal  = if ($origMail) { $origMail.Split("@")[0] } else { $upnLocal }
+    $mailDomain = if ($origMail) { $origMail.Split("@")[1] } else { $upnDomain }
+
+    $alreadyRenamed = $upnLocal.ToLower().StartsWith("historical-")
+    $newMail = "historical-$mailLocal@$mailDomain"
+    $newUpn  = "historical-$upnLocal@$upnDomain"
+    $newDisplayName = "Historical - $($Candidate.DisplayName)"
+
+    try {
+        Write-Log ">> $upn" "HEAD" $LogBox
+
+        # 1. Convert mailbox to Shared + rename primary SMTP (subprocess - avoids Graph/EXO assembly conflict)
+        if ($origMail) {
+            $cfg = Get-CertConfig
+            $eParams = @{
+                AppId        = if ($cfg) { $cfg['AppId'] }         else { "" }
+                Thumbprint   = if ($cfg) { $cfg['CertThumbprint'] } else { "" }
+                Organization = if ($cfg) { $cfg['ExchangeOrg'] }   else { "" }
+                OrigMail     = $origMail
+                NewMail      = $newMail
+                AlreadyRenamed = $alreadyRenamed
+            }
+            $exoCommands = @'
+Write-Output "Converting mailbox to Shared: $($p.OrigMail)"
+Set-Mailbox -Identity $p.OrigMail -Type Shared
+Write-Output "Mailbox converted to Shared."
+
+if (-not $p.AlreadyRenamed) {
+    Write-Output "Adding new proxy address: $($p.NewMail)"
+    Set-Mailbox -Identity $p.OrigMail -EmailAddresses @{Add="smtp:$($p.NewMail)"}
+    Write-Output "Promoting to primary SMTP: $($p.NewMail)"
+    Set-Mailbox -Identity $p.OrigMail -PrimarySmtpAddress $p.NewMail
+    Write-Output "Primary SMTP updated."
+} else {
+    Write-Output "Address already carries historical- prefix - skipping SMTP rename."
+}
+'@
+            Step "Convert mailbox to Shared + rename primary SMTP" {
+                Invoke-EXOProcess -Params $eParams -Commands $exoCommands -LogBox $LogBox -WhatIf $WhatIfMode
+            }
+            $result.MailboxConverted = $true
+        } else {
+            Write-Log "  No mailbox (Mail property empty) - skipping shared-mailbox conversion." "WARN" $LogBox
+        }
+
+        # 2. Rename DisplayName + UPN (Graph) - skip for on-prem synced accounts
+        if ($Candidate.Synced) {
+            Write-Log "  Synced from on-prem AD - skipping DisplayName/UPN rename (would be reverted by next AAD Connect cycle). Use Offboard-ADUser.ps1 / on-prem AD to rename this account." "WARN" $LogBox
+        } elseif ($alreadyRenamed) {
+            Write-Log "  UPN already carries historical- prefix - skipping rename." "INFO" $LogBox
+            $result.Renamed = $true
+        } else {
+            Step "Rename DisplayName -> `"$newDisplayName`", UPN -> `"$newUpn`"" {
+                $body = @{ displayName = $newDisplayName; userPrincipalName = $newUpn } | ConvertTo-Json
+                Invoke-MgGraphRequest -Method PATCH -Uri "https://graph.microsoft.com/v1.0/users/$($Candidate.Id)" -Body $body -ContentType "application/json" | Out-Null
+            }
+            $result.Renamed = $true
+        }
+
+        # 3. Remove all assigned licenses
+        if ($Candidate.SkuIds.Count -gt 0) {
+            Step "Remove $($Candidate.SkuIds.Count) assigned license(s)" {
+                $licBody = @{ addLicenses = @(); removeLicenses = @($Candidate.SkuIds) } | ConvertTo-Json -Depth 5
+                Invoke-MgGraphRequest -Method POST -Uri "https://graph.microsoft.com/v1.0/users/$($Candidate.Id)/assignLicense" -Body $licBody -ContentType "application/json" | Out-Null
+            }
+            $result.LicensesRemoved = $true
+        } else {
+            Write-Log "  No licenses assigned - nothing to remove." "INFO" $LogBox
+        }
+
+        Write-Log "  Done: $upn" "SUCCESS" $LogBox
+    } catch {
+        $result.Error = "$_"
+        Write-Log "  ERROR on $upn - $_" "ERROR" $LogBox
+    }
+
+    return $result
+}
+
+function SC-Lbl { param($t, $x, $y, $w, $h, $c = $TEXT, $f = $F_NORM)
+    $l = New-Object System.Windows.Forms.Label
+    $l.Text = $t; $l.Location = New-Object System.Drawing.Point($x, $y); $l.Size = New-Object System.Drawing.Size($w, $h)
+    $l.Font = $f; $l.ForeColor = $c; $l.BackColor = [System.Drawing.Color]::Transparent; $l
+}
+function SC-Btn { param($t, $x, $y, $w, $h, $bg = $ACCENT, $fg = [System.Drawing.Color]::White)
+    $b = New-Object System.Windows.Forms.Button
+    $b.Text = $t; $b.Location = New-Object System.Drawing.Point($x, $y); $b.Size = New-Object System.Drawing.Size($w, $h)
+    $b.Font = $F_BOLD; $b.ForeColor = $fg; $b.BackColor = $bg
+    $b.FlatStyle = "Flat"; $b.FlatAppearance.BorderSize = 0; $b
+}
+
+function Show-ScanPage {
+    param($Owner)
+
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = "Entra ID Inactive Licensed User Scanner"
+    $form.Size = New-Object System.Drawing.Size(1180, 760)
+    $form.StartPosition = "CenterScreen"; $form.BackColor = $BG
+    $form.FormBorderStyle = "Sizable"; $form.MinimumSize = New-Object System.Drawing.Size(900, 560); $form.Font = $F_NORM
+    
+    $pnlTop = New-Object System.Windows.Forms.Panel
+    $pnlTop.Dock = "Top"; $pnlTop.Height = 90; $pnlTop.BackColor = [System.Drawing.Color]::FromArgb(12, 16, 24)
+    $form.Controls.Add($pnlTop)
+    
+    $lblTitle = SC-Lbl "Entra ID Inactive Licensed User Scanner" 16 10 700 26 $TEXT (New-Object System.Drawing.Font("Segoe UI Semibold", 13))
+    $pnlTop.Controls.Add($lblTitle)
+    
+    $lblDays = SC-Lbl "Inactive threshold (days):" 16 46 170 22 $TEXT
+    $pnlTop.Controls.Add($lblDays)
+    $numDays = New-Object System.Windows.Forms.NumericUpDown
+    $numDays.Location = New-Object System.Drawing.Point(190, 44); $numDays.Size = New-Object System.Drawing.Size(70, 22)
+    $numDays.Minimum = 1; $numDays.Maximum = 3650; $numDays.Value = $InactiveDays
+    $numDays.Font = $F_NORM; $numDays.BackColor = $CLR_INPUT; $numDays.ForeColor = $TEXT
+    $pnlTop.Controls.Add($numDays)
+    
+    $chkWhatIf = New-Object System.Windows.Forms.CheckBox
+    $chkWhatIf.Text = "WhatIf - simulation only (no changes)"
+    $chkWhatIf.Location = New-Object System.Drawing.Point(280, 46); $chkWhatIf.Size = New-Object System.Drawing.Size(280, 22)
+    $chkWhatIf.Font = $F_BOLD; $chkWhatIf.ForeColor = $WARN; $chkWhatIf.BackColor = [System.Drawing.Color]::Transparent
+    $chkWhatIf.Checked = $true
+    $pnlTop.Controls.Add($chkWhatIf)
+    
+    $btnScan       = SC-Btn "Scan Tenant"       580 40 120 32 $ACCENT
+    $btnSelectAll  = SC-Btn "Select All"        710 40 100 32 $PANEL $TEXT
+    $btnSelectNone = SC-Btn "Select None"       818 40 100 32 $PANEL $TEXT
+    $btnSetupAuth  = SC-Btn "Setup Auth"        926 40 110 32 $PANEL $WARN
+    $btnExport     = SC-Btn "Export CSV"       1044 40 110 32 $PANEL $TEXT
+    $pnlTop.Controls.AddRange(@($btnScan, $btnSelectAll, $btnSelectNone, $btnSetupAuth, $btnExport))
+    
+    $grid = New-Object System.Windows.Forms.DataGridView
+    $grid.Location = New-Object System.Drawing.Point(0, 90)
+    $grid.Anchor = "Top,Bottom,Left,Right"
+    $grid.Size = New-Object System.Drawing.Size(1164, 400)
+    $grid.BackgroundColor = $PANEL
+    $grid.ForeColor = $TEXT
+    $grid.DefaultCellStyle.BackColor = $CLR_INPUT
+    $grid.DefaultCellStyle.ForeColor = $TEXT
+    $grid.DefaultCellStyle.SelectionBackColor = $ACCENT
+    $grid.ColumnHeadersDefaultCellStyle.BackColor = $PANEL
+    $grid.ColumnHeadersDefaultCellStyle.ForeColor = $TEXT
+    $grid.ColumnHeadersDefaultCellStyle.Font = $F_BOLD
+    $grid.EnableHeadersVisualStyles = $false
+    $grid.RowHeadersVisible = $false
+    $grid.AllowUserToAddRows = $false
+    $grid.AllowUserToDeleteRows = $false
+    $grid.SelectionMode = "FullRowSelect"
+    $grid.AutoSizeColumnsMode = "Fill"
+    $grid.Font = $F_NORM
+    $form.Controls.Add($grid)
+    
+    $lblStatus = SC-Lbl "Set a threshold and click Scan Tenant." 16 500 700 20 $TEXTDIM
+    $lblStatus.Anchor = "Bottom,Left"
+    
+    $progress = New-Object System.Windows.Forms.ProgressBar
+    $progress.Location = New-Object System.Drawing.Point(16, 522); $progress.Size = New-Object System.Drawing.Size(1148, 16)
+    $progress.Anchor = "Bottom,Left,Right"; $progress.Minimum = 0; $progress.Maximum = 100
+    $progress.ForeColor = $GREEN; $progress.BackColor = $PANEL
+    
+    $logBox = New-Object System.Windows.Forms.RichTextBox
+    $logBox.Location = New-Object System.Drawing.Point(16, 546); $logBox.Size = New-Object System.Drawing.Size(1148, 130)
+    $logBox.Anchor = "Bottom,Left,Right"
+    $logBox.Font = $F_MONO; $logBox.BackColor = [System.Drawing.Color]::FromArgb(10, 14, 22)
+    $logBox.ForeColor = $TEXT; $logBox.ReadOnly = $true; $logBox.BorderStyle = "None"; $logBox.ScrollBars = "Vertical"
+    
+    if ($script:StartupLog -and $script:StartupLog.Count -gt 0) {
+        Write-Log "--- Startup log (module bootstrap / Graph version-skew repair / role check) ---" "INFO" $logBox
+        foreach ($entry in $script:StartupLog) {
+            $mappedLevel = switch ($entry.Level) { "OK" { "SUCCESS" } "ERR" { "ERROR" } "WARN" { "WARN" } default { "INFO" } }
+            Write-Log $entry.Message $mappedLevel $logBox
+        }
+        Write-Log "--- End startup log ---" "INFO" $logBox
+    }
+    
+    $pnlBot = New-Object System.Windows.Forms.Panel
+    $pnlBot.Anchor = "Bottom,Left,Right"; $pnlBot.Location = New-Object System.Drawing.Point(0, 684); $pnlBot.Size = New-Object System.Drawing.Size(1180, 54)
+    $pnlBot.BackColor = [System.Drawing.Color]::FromArgb(12, 16, 24)
+    
+    $btnProcess = SC-Btn "Process Selected Accounts" 16 10 220 34 $DANGER
+    $btnProcess.Font = New-Object System.Drawing.Font("Segoe UI Semibold", 10)
+    $btnClose = SC-Btn "Close" 1076 10 88 34 $PANEL $TEXT
+    $pnlBot.Controls.AddRange(@($btnProcess, $btnClose))
+    
+    $form.Controls.AddRange(@($lblStatus, $progress, $logBox, $pnlBot))
+    
+    $script:ScanCandidates = @()
+    
+    function Refresh-Grid {
+        $grid.Rows.Clear()
+        if ($grid.Columns.Count -eq 0) {
+            $grid.Columns.Add((New-Object System.Windows.Forms.DataGridViewCheckBoxColumn -Property @{ Name = "Select"; HeaderText = "Sel"; Width = 40 })) | Out-Null
+            $grid.Columns.Add("DisplayName", "Display Name") | Out-Null
+            $grid.Columns.Add("UserPrincipalName", "UPN") | Out-Null
+            $grid.Columns.Add("Mail", "Mail") | Out-Null
+            $grid.Columns.Add("AccountEnabled", "Enabled") | Out-Null
+            $grid.Columns.Add("Synced", "AD-Synced") | Out-Null
+            $grid.Columns.Add("DaysInactive", "Days Inactive") | Out-Null
+            $grid.Columns.Add("LicenseCount", "Licenses") | Out-Null
+            foreach ($colName in @("DisplayName","UserPrincipalName","Mail","AccountEnabled","Synced","DaysInactive","LicenseCount")) {
+                $grid.Columns[$colName].ReadOnly = $true
+            }
+        }
+        foreach ($c in $script:ScanCandidates) {
+            $idx = $grid.Rows.Add($false, $c.DisplayName, $c.UserPrincipalName, $c.Mail, $c.AccountEnabled, $c.Synced, $c.DaysInactive, $c.LicenseCount)
+            if ($c.Synced) { $grid.Rows[$idx].DefaultCellStyle.ForeColor = $WARN }
+            if (-not $c.AccountEnabled) { $grid.Rows[$idx].Cells['AccountEnabled'].Style.ForeColor = $DANGER }
+        }
+    }
+    
+    $grid.Add_CurrentCellDirtyStateChanged({
+        if ($grid.IsCurrentCellDirty) { $grid.CommitEdit([System.Windows.Forms.DataGridViewDataErrorContexts]::Commit) }
+    })
+    
+    $btnScan.Add_Click({
+        $btnScan.Enabled = $false
+        $logBox.Clear()
+        $lblStatus.ForeColor = $TEXTDIM; $lblStatus.Text = "Scanning tenant..."
+        try {
+            $script:ScanCandidates = Get-InactiveLicensedUsers -InactiveDays ([int]$numDays.Value) -LogBox $logBox
+            Refresh-Grid
+            $lblStatus.ForeColor = $GREEN
+            $lblStatus.Text = "$($script:ScanCandidates.Count) inactive licensed account(s) found. Review and check accounts to process."
+            $reportPath = Join-Path (Split-Path $PSCommandPath -Parent) "InactiveUserScan_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+            Export-ScanReport -Candidates $script:ScanCandidates -Path $reportPath
+            Write-Log "Scan report written: $reportPath" "SUCCESS" $logBox
+        } catch {
+            $lblStatus.ForeColor = $DANGER; $lblStatus.Text = "[X] Scan failed - see log."
+            Write-Log "Scan error: $_" "ERROR" $logBox
+    
+            if ("$_" -match "403|Authorization_RequestDenied") {
+                Write-Log "403 detected - running two follow-up probes to isolate the cause..." "WARN" $logBox
+                try {
+                    $ctx = Get-MgContext
+                    if ($ctx) {
+                        Write-Log "Context at failure time: AuthType=$($ctx.AuthType)  ClientId=$($ctx.ClientId)  Account=$($ctx.Account)  Scopes=$($ctx.Scopes -join ',')" "INFO" $logBox
+                    } else {
+                        Write-Log "Context at failure time: Get-MgContext returned nothing." "WARN" $logBox
+                    }
+                } catch { Write-Log "Could not read Get-MgContext: $_" "WARN" $logBox }
+    
+                try {
+                    $probe1 = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/users?`$top=1&`$select=id,displayName" -ErrorAction Stop
+                    Write-Log "Probe 1 (basic /users query, no signInActivity): SUCCEEDED - $($probe1.value.Count) result(s). Confirms the token/permissions work for basic reads; the failure is specific to signInActivity." "SUCCESS" $logBox
+                } catch {
+                    Write-Log "Probe 1 (basic /users query, no signInActivity): FAILED - $_. The token itself lacks basic Directory/User read - broader than just signInActivity." "ERROR" $logBox
+                }
+    
+                try {
+                    $probe2 = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/users?`$top=1&`$select=id,displayName,signInActivity" -Headers @{ ConsistencyLevel = "eventual" } -ErrorAction Stop
+                    Write-Log "Probe 2 (signInActivity + ConsistencyLevel:eventual header): SUCCEEDED - $($probe2.value.Count) result(s). The eventual-consistency header appears to be required for this tenant." "SUCCESS" $logBox
+                } catch {
+                    Write-Log "Probe 2 (signInActivity + ConsistencyLevel:eventual header): FAILED - $_" "ERROR" $logBox
+                }
+            }
+        } finally { $btnScan.Enabled = $true }
+    })
+    
+    $btnSelectAll.Add_Click({ foreach ($row in $grid.Rows) { $row.Cells['Select'].Value = $true } })
+    $btnSelectNone.Add_Click({ foreach ($row in $grid.Rows) { $row.Cells['Select'].Value = $false } })
+    
+    $btnExport.Add_Click({
+        if ($script:ScanCandidates.Count -eq 0) { [System.Windows.Forms.MessageBox]::Show("Run a scan first.", "Nothing to export") | Out-Null; return }
+        $sfd = New-Object System.Windows.Forms.SaveFileDialog
+        $sfd.Filter = "CSV files (*.csv)|*.csv"
+        $sfd.FileName = "InactiveUserScan_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+        if ($sfd.ShowDialog() -eq "OK") {
+            Export-ScanReport -Candidates $script:ScanCandidates -Path $sfd.FileName
+            Write-Log "Exported: $($sfd.FileName)" "SUCCESS" $logBox
+        }
+    })
+    
+    $btnSetupAuth.Add_Click({
+        $r = [System.Windows.Forms.MessageBox]::Show(
+            "This creates a certificate-based app registration in this tenant so the tool no longer needs interactive MFA sign-in each run, and grants it AuditLog.Read.All (needed to read sign-in activity) plus Exchange.ManageAsApp.`n`nSign in with a GLOBAL ADMIN account when prompted. Continue?",
+            "Setup Auth", "YesNo", "Question")
+        if ($r -ne "Yes") { return }
+        $btnSetupAuth.Enabled = $false
+        $ok = Initialize-M365Auth -LogBox $logBox
+        $btnSetupAuth.Enabled = $true
+        if ($ok) { $lblStatus.ForeColor = $GREEN; $lblStatus.Text = "[OK] Non-interactive auth configured. Wait 5-10 min then Scan Tenant." }
+        else { $lblStatus.ForeColor = $DANGER; $lblStatus.Text = "[X] Setup Auth failed - see log." }
+    })
+    
+    $btnProcess.Add_Click({
+        # Resolve selection directly from the grid rows (authoritative for checkbox state)
+        $selectedUpns = @()
+        foreach ($row in $grid.Rows) {
+            if ([bool]$row.Cells['Select'].Value) { $selectedUpns += [string]$row.Cells['UserPrincipalName'].Value }
+        }
+        $selected = @($script:ScanCandidates | Where-Object { $selectedUpns -contains $_.UserPrincipalName })
+    
+        if ($selected.Count -eq 0) {
+            [System.Windows.Forms.MessageBox]::Show("No accounts checked.", "Nothing selected") | Out-Null
+            return
+        }
+    
+        $whatIfMode = [bool]$chkWhatIf.Checked
+        $preview = ($selected | Select-Object -First 25 | ForEach-Object { "  - $($_.UserPrincipalName)" }) -join "`n"
+        if ($selected.Count -gt 25) { $preview += "`n  ... and $($selected.Count - 25) more" }
+    
+        $modeText = if ($whatIfMode) { "WHATIF SIMULATION (no changes will be made)" } else { "LIVE - THIS WILL MAKE REAL CHANGES" }
+        $r = [System.Windows.Forms.MessageBox]::Show(
+            "Mode: $modeText`n`nFor each of the $($selected.Count) account(s) below:`n  1. Convert mailbox to Shared`n  2. Rename to `"Historical - <name>`" / `"historical-<upn>`"`n  3. Remove all assigned licenses`n`n$preview`n`nProceed?",
+            "Confirm Remediation", "YesNo", "Warning")
+        if ($r -ne "Yes") { return }
+    
+        $btnProcess.Enabled = $false
+        $results = New-Object System.Collections.Generic.List[object]
+        $i = 0
+        foreach ($cand in $selected) {
+            $i++
+            $progress.Value = [int](($i / $selected.Count) * 100)
+            $lblStatus.Text = "Processing $i of $($selected.Count): $($cand.UserPrincipalName)"
+            [System.Windows.Forms.Application]::DoEvents()
+            $results.Add((Invoke-UserRemediation -Candidate $cand -WhatIfMode $whatIfMode -LogBox $logBox))
+        }
+        $progress.Value = 100
+    
+        $logPath = Join-Path (Split-Path $PSCommandPath -Parent) "InactiveUserScan_Actions_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+        $results | Export-Csv -Path $logPath -NoTypeInformation -Encoding UTF8
+        $failCount = @($results | Where-Object { $_.Error -ne "" }).Count
+    
+        if ($failCount -eq 0) { $lblStatus.ForeColor = $GREEN; $lblStatus.Text = "[OK] Processed $($results.Count) account(s), 0 errors. Log: $logPath" }
+        else { $lblStatus.ForeColor = $WARN; $lblStatus.Text = "[!] Processed $($results.Count) account(s), $failCount error(s). Log: $logPath" }
+    
+        Write-Log "Action log written: $logPath" "SUCCESS" $logBox
+        $btnProcess.Enabled = $true
+    })
+    
+    $btnClose.Add_Click({ $form.Close() })
+    
+
+    [void]$form.ShowDialog($Owner)
+}
 
 # ============================================================
 # ON-PREM AD CLEANUP (from Disable-InactiveADComputers.ps1 / Disable-InactiveADUsers.ps1)
