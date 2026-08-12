@@ -215,6 +215,7 @@ function Invoke-ModuleBootstrap {
             $c = switch ($l) { "OK" { "Green" } "WARN" { "Yellow" } "ERR" { "Red" } default { "Cyan" } }
             Write-Host "[$(Get-Date -Format 'HH:mm:ss')][$l] $m" -ForegroundColor $c
         }
+        if ($script:StartupLog) { $script:StartupLog.Add([PSCustomObject]@{ Level = $l; Message = $m }) }
     }
 
     BL "Checking required modules (running as: $($env:USERNAME))..."
@@ -304,6 +305,82 @@ function Invoke-ModuleBootstrap {
     BL "Module check complete." "OK"
 }
 
+function Repair-GraphModuleVersionSkew {
+    # A -MinimumVersion check per module (as above) only guarantees each Microsoft.Graph.*
+    # submodule is AT LEAST some old floor version - it says nothing about whether the
+    # submodules match EACH OTHER. On a machine where Authentication got upgraded (e.g. by
+    # some other install/update) while Applications/Identity.DirectoryManagement did not,
+    # each ends up on a different version in a different module path (PS7-native vs the
+    # legacy Windows PowerShell path PS7 still sees for compatibility). Unversioned
+    # Import-Module then resolves Authentication to the newest available version, but
+    # Applications pulls in its OWN required (older) Authentication version internally -
+    # two different physical DLLs claiming the same assembly identity, which throws
+    # "Assembly with same name is already loaded" the instant both are imported, even in a
+    # brand-new process.
+    #
+    # Uninstalling the mismatched old versions to force alignment sounds right but is
+    # fragile in practice: on a server also running AAD Connect Sync / AAD App Proxy
+    # Connector / SPO Management Shell, some background service or scheduled task may
+    # already have those exact DLLs open, and Windows won't let anyone - Admin included -
+    # delete or replace a file another process holds a handle to. Confirmed on a live
+    # Server 2019 box: repeated elevated repair attempts left the module versions
+    # completely unchanged.
+    #
+    # Side-by-side module versions are normal and safe in PowerShell, so instead of fighting
+    # file locks, just make sure the target version is ALSO installed (never touching the
+    # old ones) and expose it via $script:GraphModuleTargetVersion so every Import-Module
+    # call for this family can pin -RequiredVersion explicitly. An explicit version request
+    # is never ambiguous, so the stale older copies become permanently harmless.
+    param([bool]$Silent = $false)
+
+    function RGL { param($m, $l = "INFO")
+        if (-not $Silent) {
+            $c = switch ($l) { "OK" { "Green" } "WARN" { "Yellow" } "ERR" { "Red" } default { "Cyan" } }
+            Write-Host "[$(Get-Date -Format 'HH:mm:ss')][$l] $m" -ForegroundColor $c
+        }
+        if ($script:StartupLog) { $script:StartupLog.Add([PSCustomObject]@{ Level = $l; Message = $m }) }
+    }
+
+    $graphModules = @("Microsoft.Graph.Authentication", "Microsoft.Graph.Users", "Microsoft.Graph.Applications", "Microsoft.Graph.Identity.DirectoryManagement")
+
+    RGL "Resolving a pinned Microsoft.Graph module version for this family (avoids ambiguous version resolution instead of trying to remove old copies)..."
+
+    $target = $null
+    try {
+        $target = (Find-Module -Name "Microsoft.Graph.Authentication" -Repository PSGallery -ErrorAction Stop).Version
+        RGL "Latest on PSGallery: $target"
+    } catch {
+        RGL "Could not query PSGallery for the latest version ($_) - falling back to the highest version already installed locally." "WARN"
+        $target = (Get-Module -ListAvailable -Name "Microsoft.Graph.Authentication" -ErrorAction SilentlyContinue | Sort-Object Version -Descending | Select-Object -First 1).Version
+        if (-not $target) {
+            RGL "No local Microsoft.Graph.Authentication install found either - cannot pin a version. Import-Module calls will fall back to unpinned (may still hit the assembly conflict)." "ERR"
+            return
+        }
+        RGL "Using locally-installed version: $target" "WARN"
+    }
+
+    foreach ($mn in $graphModules) {
+        $hasTarget = Get-Module -ListAvailable -Name $mn -ErrorAction SilentlyContinue | Where-Object { $_.Version -eq $target }
+        if ($hasTarget) { RGL "$mn $target - already present." "OK"; continue }
+        try {
+            RGL "Installing $mn $target (AllUsers, side-by-side with any existing versions)..."
+            Install-Module -Name $mn -RequiredVersion $target -Scope AllUsers -Force -AllowClobber -Repository PSGallery -ErrorAction Stop
+            RGL "$mn $target installed." "OK"
+        } catch {
+            RGL "Failed to install $mn ${target}: $_" "ERR"
+            $target = $null
+            break
+        }
+    }
+
+    if ($target) {
+        $script:GraphModuleTargetVersion = $target
+        RGL "Pinned Graph module version for this run: $target" "OK"
+    } else {
+        RGL "No pinned version available - Import-Module calls will fall back to unpinned." "WARN"
+    }
+}
+
 # ============================================================
 # SECTION 0b - M365 ROLE VERIFICATION
 # ============================================================
@@ -316,6 +393,7 @@ function Invoke-RoleBootstrap {
             $c = switch ($l) { "OK" { "Green" } "WARN" { "Yellow" } "ERR" { "Red" } default { "Cyan" } }
             Write-Host "[$(Get-Date -Format 'HH:mm:ss')][$l] $m" -ForegroundColor $c
         }
+        if ($script:StartupLog) { $script:StartupLog.Add([PSCustomObject]@{ Level = $l; Message = $m }) }
     }
 
     $requiredRoles = @(
@@ -335,9 +413,14 @@ function Invoke-RoleBootstrap {
     }
 
     try {
-        $null = Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
-        $null = Import-Module Microsoft.Graph.Users -ErrorAction Stop
-        $null = Import-Module Microsoft.Graph.Identity.DirectoryManagement -ErrorAction Stop
+        # Pin an exact version when Repair-GraphModuleVersionSkew resolved one - see that
+        # function for why: avoids ambiguous Import-Module resolution across module paths
+        # entirely, rather than depending on old mismatched versions having been removed.
+        $verArgs = @{}
+        if ($script:GraphModuleTargetVersion) { $verArgs['RequiredVersion'] = $script:GraphModuleTargetVersion }
+        $null = Import-Module Microsoft.Graph.Authentication @verArgs -ErrorAction Stop
+        $null = Import-Module Microsoft.Graph.Users @verArgs -ErrorAction Stop
+        $null = Import-Module Microsoft.Graph.Identity.DirectoryManagement @verArgs -ErrorAction Stop
 
         $null = Connect-MgGraph -Scopes @(
             "RoleManagement.ReadWrite.Directory",
@@ -425,10 +508,18 @@ function Invoke-RoleBootstrap {
 
 $isCLI = ($SamAccountName -ne "")
 $isSilent = $isCLI
+# Startup runs (module bootstrap, Graph version-skew repair, role bootstrap) all happen
+# before the GUI window exists, so their Write-Host output only ever reached whatever
+# console launched the script - easy to miss, and useless for after-the-fact diagnosis.
+# Buffer it here and replay it into the GUI log box once that exists (see the GUI section).
+$script:StartupLog = New-Object System.Collections.Generic.List[object]
 
 Write-Host "[$(Get-Date -Format 'HH:mm:ss')][INFO] AD/M365 Offboarding Tool - v1.0 (c) Roger Fouche / Fouche Enterprises, LLC" -ForegroundColor Magenta
 
-if (-not $SkipModuleCheck) { Invoke-ModuleBootstrap -Silent:$isSilent }
+if (-not $SkipModuleCheck) {
+    Invoke-ModuleBootstrap -Silent:$isSilent
+    Repair-GraphModuleVersionSkew -Silent:$isSilent
+}
 $null = Import-Module ActiveDirectory -ErrorAction SilentlyContinue
 # Import EXO BEFORE any Graph modules are loaded - both ship MSAL.NET but different
 # versions. Whichever is imported first wins. EXO must win to avoid the
@@ -651,7 +742,18 @@ function Connect-M365Graph {
         "User.ReadWrite.All", "Group.ReadWrite.All", "Directory.ReadWrite.All",
         "Organization.Read.All", "RoleManagement.ReadWrite.Directory", "Sites.FullControl.All"
     ))
-    $null = Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
+    $verArgs = @{}
+    if ($script:GraphModuleTargetVersion) { $verArgs['RequiredVersion'] = $script:GraphModuleTargetVersion }
+    $null = Import-Module Microsoft.Graph.Authentication @verArgs -ErrorAction Stop
+
+    # Force a clean slate. If an earlier interactive Connect-MgGraph happened in this same
+    # process (Role Bootstrap runs one at startup whenever no cert config exists YET - i.e.
+    # exactly the state the very first Setup Auth run starts from) and this call reconnects
+    # with the cert instead, don't rely on the SDK to fully swap contexts mid-session -
+    # disconnect explicitly first so there is no ambiguity about which identity's token the
+    # next API call actually carries.
+    try { Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null } catch {}
+
     $cfg = Get-CertConfig
     if ($cfg) {
         # Delegate to Connect-ToGraph which resolves the cert from LocalMachine\My first,
@@ -665,6 +767,11 @@ function Connect-M365Graph {
         if ($ctx -and $ctx.TenantId -and -not $script:Config.TenantId) {
             $script:Config.TenantId = $ctx.TenantId; Save-Config
         }
+    }
+
+    $finalCtx = Get-MgContext
+    if ($finalCtx) {
+        Write-Host "[$(Get-Date -Format 'HH:mm:ss')][INFO] Graph context: AuthType=$($finalCtx.AuthType)  ClientId=$($finalCtx.ClientId)  Account=$($finalCtx.Account)" -ForegroundColor Cyan
     }
 }
 
@@ -799,11 +906,17 @@ function Initialize-M365Auth {
 
     $authCommands = @'
 $ErrorActionPreference = "Stop"
-$result = [ordered]@{ Success = $false; AppId = ""; TenantId = ""; CertThumbprint = ""; ExchangeOrg = ""; ErrorMessage = "" }
+$result = [ordered]@{ Success = $false; AppId = ""; TenantId = ""; CertThumbprint = ""; ExchangeOrg = ""; ErrorMessage = ""; Warnings = "" }
 try {
-    Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
-    Import-Module Microsoft.Graph.Applications -ErrorAction Stop
-    Import-Module Microsoft.Graph.Identity.DirectoryManagement -ErrorAction Stop
+    # This child process starts with nothing loaded, so it CAN still hit the same
+    # assembly conflict if the underlying module install itself has version skew across
+    # paths - pinning here is what actually fixed Setup Auth on the live test box, not
+    # process isolation alone (confirmed: isolation alone left it failing).
+    $verArgs = @{}
+    if ($TargetGraphVersion) { $verArgs["RequiredVersion"] = $TargetGraphVersion }
+    Import-Module Microsoft.Graph.Authentication @verArgs -ErrorAction Stop
+    Import-Module Microsoft.Graph.Applications @verArgs -ErrorAction Stop
+    Import-Module Microsoft.Graph.Identity.DirectoryManagement @verArgs -ErrorAction Stop
 
     Write-Host "Connecting to Microsoft Graph - a sign-in window/browser should appear..." -ForegroundColor Cyan
     Connect-MgGraph -Scopes @(
@@ -844,9 +957,9 @@ try {
     $graphRoles = @()
     foreach ($p in $graphPermNames) {
         $roleObj = $graphSP.AppRoles | Where-Object { $_.Value -eq $p } | Select-Object -First 1
-        if ($roleObj) { $graphRoles += @{ Id = [string]$roleObj.Id; Type = "Role" } }
+        if ($roleObj) { $graphRoles += @{ Name = $p; Id = [string]$roleObj.Id; Type = "Role" } }
     }
-    $reqAccess = @(@{ ResourceAppId = "00000003-0000-0000-c000-000000000000"; ResourceAccess = $graphRoles })
+    $reqAccess = @(@{ ResourceAppId = "00000003-0000-0000-c000-000000000000"; ResourceAccess = ($graphRoles | ForEach-Object { @{ Id = $_.Id; Type = $_.Type } }) })
 
     $exoRoleId = $null
     if ($exoSP) {
@@ -875,16 +988,50 @@ try {
     Write-Host "Waiting 15s for propagation, then granting admin consent..." -ForegroundColor Cyan
     Start-Sleep -Seconds 15
 
+    # New-MgServicePrincipalAppRoleAssignment can fail transiently right after the SP was
+    # just created (directory replication lag) even after the 15s wait above - retry each
+    # one instead of the previous silent "try { } catch {}" (which meant a failed grant here
+    # showed up later only as a confusing 403 Authorization_RequestDenied, with zero
+    # indication which permission was actually missing).
+    function Grant-AppRoleWithRetry {
+        param($ServicePrincipalId, $ResourceId, $AppRoleId, $Label)
+        for ($i = 1; $i -le 5; $i++) {
+            try {
+                New-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $ServicePrincipalId -PrincipalId $ServicePrincipalId -ResourceId $ResourceId -AppRoleId $AppRoleId | Out-Null
+                Write-Host "  Granted: $Label" -ForegroundColor Green
+                return $true
+            } catch {
+                if ($i -eq 5) {
+                    Write-Host "  FAILED to grant ${Label}: $_" -ForegroundColor Red
+                    return $false
+                }
+                Start-Sleep -Seconds 5
+            }
+        }
+    }
+
+    $roleGrantFailures = New-Object System.Collections.Generic.List[string]
     foreach ($role in $graphRoles) {
-        try { New-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $sp.Id -PrincipalId $sp.Id -ResourceId $graphSP.Id -AppRoleId $role.Id | Out-Null } catch {}
+        if (-not (Grant-AppRoleWithRetry -ServicePrincipalId $sp.Id -ResourceId $graphSP.Id -AppRoleId $role.Id -Label $role.Name)) {
+            $roleGrantFailures.Add($role.Name)
+        }
     }
     if ($exoSP -and $exoRoleId) {
-        try { New-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $sp.Id -PrincipalId $sp.Id -ResourceId $exoSP.Id -AppRoleId $exoRoleId | Out-Null } catch {}
+        if (-not (Grant-AppRoleWithRetry -ServicePrincipalId $sp.Id -ResourceId $exoSP.Id -AppRoleId $exoRoleId -Label "Exchange.ManageAsApp")) {
+            $roleGrantFailures.Add("Exchange.ManageAsApp")
+        }
     }
     if ($spoSP -and $spoRoleId) {
-        try { New-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $sp.Id -PrincipalId $sp.Id -ResourceId $spoSP.Id -AppRoleId $spoRoleId | Out-Null } catch {}
+        if (-not (Grant-AppRoleWithRetry -ServicePrincipalId $sp.Id -ResourceId $spoSP.Id -AppRoleId $spoRoleId -Label "Sites.FullControl.All")) {
+            $roleGrantFailures.Add("Sites.FullControl.All")
+        }
     }
-    Write-Host "Admin consent granted." -ForegroundColor Green
+    if ($roleGrantFailures.Count -gt 0) {
+        $result.Warnings = "Could not grant: $($roleGrantFailures -join ', '). Fix in Entra admin center > Enterprise Applications > ADM365LifecycleTool > Permissions, or just re-run Setup Auth."
+        Write-Host "WARNING: $($result.Warnings)" -ForegroundColor Yellow
+    } else {
+        Write-Host "Admin consent granted for all requested permissions." -ForegroundColor Green
+    }
 
     try {
         $exoAdmRole = Get-MgDirectoryRole -Filter "displayName eq 'Exchange Administrator'" -ErrorAction SilentlyContinue
@@ -918,8 +1065,31 @@ try {
     Write-Host " Wait 5-10 minutes before first use." -ForegroundColor Yellow
     Write-Host "============================================" -ForegroundColor Green
 } catch {
-    $result.ErrorMessage = "$_"
-    Write-Host "[ERROR] Setup failed: $_" -ForegroundColor Red
+    $errLine = $_.InvocationInfo.ScriptLineNumber
+    $diag = New-Object System.Collections.Generic.List[string]
+    try {
+        $diag.Add("PSVersion: $($PSVersionTable.PSVersion)")
+        $wi = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $diag.Add("Running as: $($wi.Name)")
+        $wp = New-Object Security.Principal.WindowsPrincipal($wi)
+        $diag.Add("Elevated: $($wp.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator))")
+        $diag.Add("PSModulePath entries:")
+        ($env:PSModulePath -split ";") | ForEach-Object { $diag.Add("  $_") }
+        $diag.Add("Get-Module -ListAvailable for the three imported modules:")
+        foreach ($mn in @("Microsoft.Graph.Authentication","Microsoft.Graph.Applications","Microsoft.Graph.Identity.DirectoryManagement")) {
+            $mods = Get-Module -ListAvailable -Name $mn -ErrorAction SilentlyContinue
+            if ($mods) { foreach ($m in $mods) { $diag.Add("  $mn $($m.Version) -> $($m.ModuleBase)") } }
+            else { $diag.Add("  $mn : NOT FOUND") }
+        }
+        $diag.Add("Loaded assemblies matching Microsoft.Graph*:")
+        [AppDomain]::CurrentDomain.GetAssemblies() | Where-Object { $_.GetName().Name -like "Microsoft.Graph*" } | ForEach-Object {
+            $diag.Add("  $($_.GetName().Name) v$($_.GetName().Version) -> $($_.Location)")
+        }
+    } catch { $diag.Add("diagnostic collection error: $_") }
+
+    $result.ErrorMessage = "$_ (failed at line $errLine)`n---DIAGNOSTICS---`n" + ($diag -join "`n")
+    Write-Host "[ERROR] Setup failed: $_ (line $errLine)" -ForegroundColor Red
+    $diag | ForEach-Object { Write-Host $_ -ForegroundColor DarkGray }
     if ((Test-Path variable:cert) -and $cert) {
         try { Remove-Item "Cert:\LocalMachine\My\$($cert.Thumbprint)" -DeleteKey -ErrorAction SilentlyContinue } catch {}
     }
@@ -930,6 +1100,7 @@ try {
     $scriptBody = @"
 `$ErrorActionPreference = 'Stop'
 `$FallbackExoOrg = '$fallbackExoOrg'
+`$TargetGraphVersion = '$($script:GraphModuleTargetVersion)'
 
 $authCommands
 
@@ -977,6 +1148,7 @@ Write-Host 'You may close this window now.' -ForegroundColor Cyan
     Save-Config
 
     Write-Log "Setup complete. App ID: $($r.AppId)  Cert: $($r.CertThumbprint)  Exchange Org: $($r.ExchangeOrg)" "SUCCESS" $LogBox
+    if ($r.Warnings) { Write-Log $r.Warnings "WARN" $LogBox }
     Write-Log "Wait 5-10 minutes before first use." "WARN" $LogBox
     return $true
 }
@@ -1607,6 +1779,15 @@ $logBox.Location = [System.Drawing.Point]::new(10, 560); $logBox.Size = [System.
 $logBox.Font = $F_MONO; $logBox.BackColor = [System.Drawing.Color]::FromArgb(10, 14, 22)
 $logBox.ForeColor = $TEXT; $logBox.ReadOnly = $true; $logBox.BorderStyle = "None"; $logBox.ScrollBars = "Vertical"
 $pnlScroll.Controls.Add($logBox)
+
+if ($script:StartupLog -and $script:StartupLog.Count -gt 0) {
+    Write-Log "--- Startup log (module bootstrap / Graph version-skew repair / role check) ---" "INFO" $logBox
+    foreach ($entry in $script:StartupLog) {
+        $mappedLevel = switch ($entry.Level) { "OK" { "SUCCESS" } "ERR" { "ERROR" } "WARN" { "WARN" } default { "INFO" } }
+        Write-Log $entry.Message $mappedLevel $logBox
+    }
+    Write-Log "--- End startup log ---" "INFO" $logBox
+}
 
 # Bottom bar
 $pnlBot = New-Object System.Windows.Forms.Panel
