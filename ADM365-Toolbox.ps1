@@ -4,19 +4,25 @@
 
 .DESCRIPTION
     Single script combining Onboard-ADUser.ps1, Offboard-ADUser.ps1,
-    Set-ADEntraHardMatch.ps1, and Find-InactiveLicensedUsers.ps1 behind one
-    launcher menu, so the shared module-bootstrap/auth/Graph-connection code
-    (previously duplicated four times) is written and fixed exactly once.
+    Set-ADEntraHardMatch.ps1, and Find-InactiveLicensedUsers.ps1 (all M365/
+    Entra tools) plus Disable-InactiveADComputers.ps1 and
+    Disable-InactiveADUsers.ps1 (pure on-prem AD housekeeping, no M365 auth
+    needed) behind one launcher menu, so the shared module-bootstrap/auth/
+    Graph-connection code (previously duplicated across the four M365 tools)
+    is written and fixed exactly once.
 
     On every launch it installs/updates required modules, repairs any
     Microsoft.Graph module version skew, verifies M365 admin roles, and
     auto-discovers the AD environment from the DC - then opens a launcher
-    with buttons for each tool. Each tool's own business logic and GUI are
-    unchanged from their standalone originals; only the shared plumbing
+    with buttons for each tool. Each M365 tool's own business logic and GUI
+    are unchanged from their standalone originals; only the shared plumbing
     (module bootstrap, Setup Auth, Graph/Exchange connection, logging) is
-    now written once.
+    now written once. The two on-prem AD cleanup tools are ported as a
+    scan-and-select grid (review and check off exactly which computers/users
+    to disable+move) rather than their originals' filter-and-blind-bulk-
+    disable behavior - safer for a destructive bulk action.
 
-    The four original standalone scripts remain in this repo unchanged and
+    The original standalone scripts remain in this repo unchanged and
     independently runnable (NinjaRMM automation-script invocation of a
     single tool, or double-click) - this toolbox is an addition, not a
     replacement.
@@ -1219,6 +1225,274 @@ function Show-OffboardPage   { param($Owner) Write-Log "Offboard page not yet im
 function Show-HardMatchPage  { param($Owner) Write-Log "Hard-Match page not yet implemented in the combined toolbox - use Set-ADEntraHardMatch.ps1 directly for now." "WARN" $script:launcherLog }
 function Show-ScanPage       { param($Owner) Write-Log "Scan page not yet implemented in the combined toolbox - use Find-InactiveLicensedUsers.ps1 directly for now." "WARN" $script:launcherLog }
 
+# ============================================================
+# ON-PREM AD CLEANUP (from Disable-InactiveADComputers.ps1 / Disable-InactiveADUsers.ps1)
+# Pure on-prem AD, no M365/Graph auth involved at all - only the
+# ActiveDirectory module (already installed by Invoke-ModuleBootstrap
+# above). Ported as a scan-and-select grid, matching the scanner page's
+# UX, rather than the originals' filter-and-blind-bulk-disable behavior -
+# same 3 actions per object (disable, restamp description, move to the
+# disabled OU), just with a review/checkbox step before anything commits.
+# ============================================================
+
+function Get-InactiveADObjects {
+    param(
+        [ValidateSet('Computer', 'User')][string]$Kind,
+        [int]$InactiveDays,
+        [string]$SearchBase,
+        [string]$DisabledOU
+    )
+    $cutoffDate = (Get-Date).AddDays(-$InactiveDays)
+    $searchParams = @{ Filter = { Enabled -eq $true } }
+    $searchParams.Properties = if ($Kind -eq 'Computer') {
+        @('LastLogonDate', 'DistinguishedName', 'Description', 'DNSHostName', 'OperatingSystem')
+    } else {
+        @('LastLogonDate', 'DistinguishedName', 'Description', 'SamAccountName', 'PasswordLastSet')
+    }
+    if ($SearchBase) { $searchParams['SearchBase'] = $SearchBase }
+
+    $dcNames = @()
+    if ($Kind -eq 'Computer') {
+        try { $dcNames = (Get-ADDomainController -Filter *).Name } catch {}
+    }
+
+    $all = if ($Kind -eq 'Computer') { Get-ADComputer @searchParams } else { Get-ADUser @searchParams }
+
+    $candidates = New-Object System.Collections.Generic.List[object]
+    foreach ($obj in $all) {
+        if ($Kind -eq 'Computer' -and $dcNames -contains $obj.Name) { continue }
+        if ($obj.DistinguishedName -like "*$DisabledOU*") { continue }
+        $lastLogon = $obj.LastLogonDate
+        if ($lastLogon -and $lastLogon -ge $cutoffDate) { continue }
+
+        $candidates.Add([PSCustomObject]@{
+            Select            = $false
+            Name              = if ($Kind -eq 'Computer') { $obj.Name } else { $obj.SamAccountName }
+            LastLogonDate     = if ($lastLogon) { $lastLogon } else { $null }
+            LastLogonText     = if ($lastLogon) { $lastLogon.ToString('yyyy-MM-dd') } else { 'Never' }
+            Detail            = if ($Kind -eq 'Computer') { $(if ($obj.OperatingSystem) { $obj.OperatingSystem } else { 'Unknown OS' }) } else { $obj.SamAccountName }
+            DistinguishedName = $obj.DistinguishedName
+            Description       = $obj.Description
+        })
+    }
+    return $candidates
+}
+
+function Show-ADCleanupPage {
+    param($Owner, [ValidateSet('Computer', 'User')][string]$Kind)
+
+    $title      = if ($Kind -eq 'Computer') { "Disable Inactive AD Computers" } else { "Disable Inactive AD Users" }
+    $detailHead = if ($Kind -eq 'Computer') { "OS" } else { "SAM Account" }
+
+    if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
+        [System.Windows.Forms.MessageBox]::Show("The ActiveDirectory module is not available on this machine. Install RSAT or run on a Domain Controller.", $title, "OK", "Error") | Out-Null
+        return
+    }
+    Import-Module ActiveDirectory -ErrorAction SilentlyContinue
+
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = $title
+    $dlg.Size = New-Object System.Drawing.Size(1040, 720)
+    $dlg.StartPosition = "CenterParent"; $dlg.BackColor = $BG
+    $dlg.FormBorderStyle = "Sizable"; $dlg.MinimumSize = New-Object System.Drawing.Size(820, 560); $dlg.Font = $F_NORM
+
+    $pnlTop = New-Object System.Windows.Forms.Panel
+    $pnlTop.Dock = "Top"; $pnlTop.Height = 110; $pnlTop.BackColor = [System.Drawing.Color]::FromArgb(12, 16, 24)
+    $dlg.Controls.Add($pnlTop)
+
+    $lblTitle2 = New-Object System.Windows.Forms.Label
+    $lblTitle2.Text = $title; $lblTitle2.Font = New-Object System.Drawing.Font("Segoe UI Semibold", 12); $lblTitle2.ForeColor = $TEXT
+    $lblTitle2.Location = New-Object System.Drawing.Point(16, 8); $lblTitle2.AutoSize = $true
+    $pnlTop.Controls.Add($lblTitle2)
+
+    $lblDays = New-Object System.Windows.Forms.Label
+    $lblDays.Text = "Inactive days:"; $lblDays.ForeColor = $TEXT; $lblDays.Location = New-Object System.Drawing.Point(16, 42); $lblDays.AutoSize = $true
+    $pnlTop.Controls.Add($lblDays)
+    $numDays = New-Object System.Windows.Forms.NumericUpDown
+    $numDays.Location = New-Object System.Drawing.Point(110, 40); $numDays.Size = New-Object System.Drawing.Size(60, 22)
+    $numDays.Minimum = 1; $numDays.Maximum = 3650; $numDays.Value = 90
+    $numDays.BackColor = $CLR_INPUT; $numDays.ForeColor = $TEXT
+    $pnlTop.Controls.Add($numDays)
+
+    $lblOU = New-Object System.Windows.Forms.Label
+    $lblOU.Text = "Disabled OU (DN, required):"; $lblOU.ForeColor = $TEXT; $lblOU.Location = New-Object System.Drawing.Point(186, 42); $lblOU.AutoSize = $true
+    $pnlTop.Controls.Add($lblOU)
+    $txtOU = New-Object System.Windows.Forms.TextBox
+    $txtOU.Location = New-Object System.Drawing.Point(360, 40); $txtOU.Size = New-Object System.Drawing.Size(360, 22)
+    $txtOU.BackColor = $CLR_INPUT; $txtOU.ForeColor = $TEXT; $txtOU.BorderStyle = "FixedSingle"
+    if ($script:E -and $script:E.DomainDN) {
+        $defaultOUName = if ($Kind -eq 'Computer') { 'Disabled Computers' } else { 'Disabled Users' }
+        $txtOU.Text = "OU=$defaultOUName,$($script:E.DomainDN)"
+    }
+    $pnlTop.Controls.Add($txtOU)
+
+    $lblSearch = New-Object System.Windows.Forms.Label
+    $lblSearch.Text = "Search base (optional, defaults to whole domain):"; $lblSearch.ForeColor = $TEXT
+    $lblSearch.Location = New-Object System.Drawing.Point(16, 72); $lblSearch.AutoSize = $true
+    $pnlTop.Controls.Add($lblSearch)
+    $txtSearchBase = New-Object System.Windows.Forms.TextBox
+    $txtSearchBase.Location = New-Object System.Drawing.Point(300, 70); $txtSearchBase.Size = New-Object System.Drawing.Size(420, 22)
+    $txtSearchBase.BackColor = $CLR_INPUT; $txtSearchBase.ForeColor = $TEXT; $txtSearchBase.BorderStyle = "FixedSingle"
+    $pnlTop.Controls.Add($txtSearchBase)
+
+    $chkWhatIf = New-Object System.Windows.Forms.CheckBox
+    $chkWhatIf.Text = "WhatIf - simulation only (no changes)"
+    $chkWhatIf.Location = New-Object System.Drawing.Point(740, 40); $chkWhatIf.Size = New-Object System.Drawing.Size(260, 22)
+    $chkWhatIf.Font = $F_BOLD; $chkWhatIf.ForeColor = $WARN; $chkWhatIf.Checked = $true
+    $pnlTop.Controls.Add($chkWhatIf)
+
+    $btnScan       = New-LauncherButton "Scan"        740  68 100 32 $ACCENT
+    $btnSelectAll  = New-LauncherButton "Select All"   850  68  85 32 $PANEL $TEXT
+    $pnlTop.Controls.AddRange(@($btnScan, $btnSelectAll))
+    $btnScan.Font = $F_BOLD; $btnSelectAll.Font = $F_BOLD
+
+    $grid = New-Object System.Windows.Forms.DataGridView
+    $grid.Location = New-Object System.Drawing.Point(0, 110); $grid.Anchor = "Top,Bottom,Left,Right"
+    $grid.Size = New-Object System.Drawing.Size(1024, 380)
+    $grid.BackgroundColor = $PANEL; $grid.ForeColor = $TEXT
+    $grid.DefaultCellStyle.BackColor = $CLR_INPUT; $grid.DefaultCellStyle.ForeColor = $TEXT
+    $grid.DefaultCellStyle.SelectionBackColor = $ACCENT
+    $grid.ColumnHeadersDefaultCellStyle.BackColor = $PANEL; $grid.ColumnHeadersDefaultCellStyle.ForeColor = $TEXT
+    $grid.ColumnHeadersDefaultCellStyle.Font = $F_BOLD; $grid.EnableHeadersVisualStyles = $false
+    $grid.RowHeadersVisible = $false; $grid.AllowUserToAddRows = $false; $grid.AllowUserToDeleteRows = $false
+    $grid.SelectionMode = "FullRowSelect"; $grid.AutoSizeColumnsMode = "Fill"; $grid.Font = $F_NORM
+    $grid.Columns.Add((New-Object System.Windows.Forms.DataGridViewCheckBoxColumn -Property @{ Name = "Select"; HeaderText = "Sel"; Width = 40 })) | Out-Null
+    $grid.Columns.Add("Name", "Name") | Out-Null
+    $grid.Columns.Add("LastLogonText", "Last Logon") | Out-Null
+    $grid.Columns.Add("Detail", $detailHead) | Out-Null
+    $grid.Columns.Add("DistinguishedName", "Distinguished Name") | Out-Null
+    foreach ($cn in @("Name", "LastLogonText", "Detail", "DistinguishedName")) { $grid.Columns[$cn].ReadOnly = $true }
+    $dlg.Controls.Add($grid)
+    $grid.Add_CurrentCellDirtyStateChanged({ if ($grid.IsCurrentCellDirty) { $grid.CommitEdit([System.Windows.Forms.DataGridViewDataErrorContexts]::Commit) } })
+
+    $lblStatus = New-Object System.Windows.Forms.Label
+    $lblStatus.Text = "Set Disabled OU and click Scan."; $lblStatus.ForeColor = $TEXTDIM
+    $lblStatus.Location = New-Object System.Drawing.Point(16, 498); $lblStatus.Size = New-Object System.Drawing.Size(1000, 20); $lblStatus.Anchor = "Bottom,Left,Right"
+    $dlg.Controls.Add($lblStatus)
+
+    $log = New-Object System.Windows.Forms.RichTextBox
+    $log.Location = New-Object System.Drawing.Point(16, 522); $log.Size = New-Object System.Drawing.Size(1000, 108); $log.Anchor = "Bottom,Left,Right"
+    $log.Font = $F_MONO; $log.BackColor = [System.Drawing.Color]::FromArgb(10, 14, 22)
+    $log.ForeColor = $TEXT; $log.ReadOnly = $true; $log.BorderStyle = "None"; $log.ScrollBars = "Vertical"
+    $dlg.Controls.Add($log)
+
+    # Preserves the originals' audit-log-file intent (their stated design goal was "a log
+    # file records every action taken") alongside the toolbox's own GUI log convention.
+    $script:_adCleanupLogPath = Join-Path $env:TEMP "ADM365Toolbox_Disable$($Kind)s_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+    $logPath = $script:_adCleanupLogPath
+    function Write-PageLog {
+        param([string]$Message, [string]$Level = "INFO")
+        Write-Log $Message $Level $log
+        try { Add-Content -Path $logPath -Value "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [$Level] $Message" -ErrorAction SilentlyContinue } catch {}
+    }
+    Write-PageLog "Log file: $logPath" "INFO"
+
+    $pnlBot = New-Object System.Windows.Forms.Panel
+    $pnlBot.Anchor = "Bottom,Left,Right"; $pnlBot.Location = New-Object System.Drawing.Point(0, 634); $pnlBot.Size = New-Object System.Drawing.Size(1024, 50)
+    $pnlBot.BackColor = [System.Drawing.Color]::FromArgb(12, 16, 24)
+    $btnProcess = New-LauncherButton "Disable + Move Selected" 16 8 240 34 $DANGER
+    $btnProcess.Font = $F_BOLD
+    $btnCloseDlg = New-LauncherButton "Close" 928 8 80 34 $PANEL $TEXT
+    $pnlBot.Controls.AddRange(@($btnProcess, $btnCloseDlg))
+    $dlg.Controls.Add($pnlBot)
+
+    $script:_adCleanupCandidates = @()
+
+    $btnScan.Add_Click({
+        if (-not $txtOU.Text) {
+            [System.Windows.Forms.MessageBox]::Show("Disabled OU is required.", $title) | Out-Null
+            return
+        }
+        $btnScan.Enabled = $false
+        $lblStatus.ForeColor = $TEXTDIM; $lblStatus.Text = "Scanning..."
+        try {
+            $ouExists = $true
+            try { Get-ADOrganizationalUnit -Identity $txtOU.Text -ErrorAction Stop | Out-Null }
+            catch { $ouExists = $false }
+            if (-not $ouExists) {
+                $r = [System.Windows.Forms.MessageBox]::Show("Target OU '$($txtOU.Text)' does not exist. Create it now?", $title, "YesNo", "Question")
+                if ($r -eq "Yes") {
+                    $ouName   = ($txtOU.Text -split ',')[0] -replace '^OU=', ''
+                    $parentDN = ($txtOU.Text -split ',', 2)[1]
+                    New-ADOrganizationalUnit -Name $ouName -Path $parentDN
+                    Write-PageLog "Created OU: $($txtOU.Text)" "SUCCESS"
+                } else {
+                    Write-PageLog "OU does not exist and was not created - scan aborted." "ERROR"
+                    $lblStatus.ForeColor = $DANGER; $lblStatus.Text = "[X] Target OU does not exist."
+                    return
+                }
+            }
+
+            $script:_adCleanupCandidates = Get-InactiveADObjects -Kind $Kind -InactiveDays ([int]$numDays.Value) -SearchBase $txtSearchBase.Text -DisabledOU $txtOU.Text
+            $grid.Rows.Clear()
+            foreach ($c in $script:_adCleanupCandidates) {
+                $grid.Rows.Add($false, $c.Name, $c.LastLogonText, $c.Detail, $c.DistinguishedName) | Out-Null
+            }
+            $lblStatus.ForeColor = $GREEN
+            $lblStatus.Text = "$($script:_adCleanupCandidates.Count) inactive $Kind(s) found. Review and check which to disable+move."
+            Write-PageLog "$($script:_adCleanupCandidates.Count) inactive $Kind(s) found (inactive $([int]$numDays.Value)+ days)." "SUCCESS"
+        } catch {
+            $lblStatus.ForeColor = $DANGER; $lblStatus.Text = "[X] Scan failed - see log."
+            Write-PageLog "Scan error: $_" "ERROR"
+        } finally { $btnScan.Enabled = $true }
+    })
+
+    $btnSelectAll.Add_Click({
+        $allChecked = $true
+        foreach ($row in $grid.Rows) { if (-not [bool]$row.Cells['Select'].Value) { $allChecked = $false; break } }
+        foreach ($row in $grid.Rows) { $row.Cells['Select'].Value = -not $allChecked }
+    })
+
+    $btnProcess.Add_Click({
+        $selectedNames = @()
+        foreach ($row in $grid.Rows) { if ([bool]$row.Cells['Select'].Value) { $selectedNames += [string]$row.Cells['Name'].Value } }
+        $selected = @($script:_adCleanupCandidates | Where-Object { $selectedNames -contains $_.Name })
+
+        if ($selected.Count -eq 0) {
+            [System.Windows.Forms.MessageBox]::Show("No accounts checked.", "Nothing selected") | Out-Null
+            return
+        }
+
+        $whatIfMode = [bool]$chkWhatIf.Checked
+        $modeText = if ($whatIfMode) { "WHATIF SIMULATION (no changes will be made)" } else { "LIVE - THIS WILL MAKE REAL CHANGES" }
+        $preview = ($selected | Select-Object -First 25 | ForEach-Object { "  - $($_.Name)" }) -join "`n"
+        if ($selected.Count -gt 25) { $preview += "`n  ... and $($selected.Count - 25) more" }
+        $r = [System.Windows.Forms.MessageBox]::Show(
+            "Mode: $modeText`n`nFor each of the $($selected.Count) $Kind(s) below: disable, restamp description, move to `"$($txtOU.Text)`".`n`n$preview`n`nProceed?",
+            "Confirm", "YesNo", "Warning")
+        if ($r -ne "Yes") { return }
+
+        $btnProcess.Enabled = $false
+        $successCount = 0; $failCount = 0
+        foreach ($c in $selected) {
+            $newDesc = "Disabled by ADM365-Toolbox on $(Get-Date -Format 'yyyy-MM-dd') | Last logon: $($c.LastLogonText) | $($c.Description)"
+            try {
+                if ($whatIfMode) {
+                    Write-PageLog "[WHATIF] Would disable, restamp description, and move: $($c.Name)" "WARN"
+                } else {
+                    Disable-ADAccount -Identity $c.DistinguishedName
+                    if ($Kind -eq 'Computer') { Set-ADComputer -Identity $c.DistinguishedName -Description $newDesc }
+                    else { Set-ADUser -Identity $c.DistinguishedName -Description $newDesc }
+                    Move-ADObject -Identity $c.DistinguishedName -TargetPath $txtOU.Text
+                    Write-PageLog "Disabled, restamped, and moved: $($c.Name)" "SUCCESS"
+                }
+                $successCount++
+            } catch {
+                Write-PageLog "FAILED: $($c.Name): $_" "ERROR"
+                $failCount++
+            }
+        }
+        $lblStatus.ForeColor = if ($failCount -eq 0) { $GREEN } else { $WARN }
+        $lblStatus.Text = "Processed $successCount, $failCount failure(s). Log: $logPath"
+        Write-PageLog "Done. Processed $successCount, $failCount failure(s)." "SUCCESS"
+        $btnProcess.Enabled = $true
+    })
+
+    $btnCloseDlg.Add_Click({ $dlg.Close() })
+
+    [void]$dlg.ShowDialog($Owner)
+}
+
 function New-LauncherButton { param($t, $x, $y, $w, $h, $bg = $ACCENT, $fg = [System.Drawing.Color]::White)
     $b = New-Object System.Windows.Forms.Button
     $b.Text = $t; $b.Location = New-Object System.Drawing.Point($x, $y); $b.Size = New-Object System.Drawing.Size($w, $h)
@@ -1228,7 +1502,7 @@ function New-LauncherButton { param($t, $x, $y, $w, $h, $bg = $ACCENT, $fg = [Sy
 
 $launcherForm = New-Object System.Windows.Forms.Form
 $launcherForm.Text = "AD/M365 Admin Toolbox"
-$launcherForm.Size = New-Object System.Drawing.Size(760, 640)
+$launcherForm.Size = New-Object System.Drawing.Size(760, 740)
 $launcherForm.StartPosition = "CenterScreen"; $launcherForm.BackColor = $BG
 $launcherForm.FormBorderStyle = "FixedDialog"; $launcherForm.MaximizeBox = $false; $launcherForm.Font = $F_NORM
 
@@ -1240,21 +1514,23 @@ $lblTitle.Location = New-Object System.Drawing.Point(16, 14); $lblTitle.AutoSize
 $pnlTitle.Controls.Add($lblTitle)
 $launcherForm.Controls.Add($pnlTitle)
 
-$btnOnboard   = New-LauncherButton "Onboard User"                  20  80 340 70
-$btnOffboard  = New-LauncherButton "Offboard User"                380  80 340 70 $DANGER
-$btnHardMatch = New-LauncherButton "Hard-Match AD <-> Entra"        20 160 340 70 $GREEN $BG
-$btnScan      = New-LauncherButton "Scan Inactive Licensed Users"  380 160 340 70 $WARN  $BG
-$btnSetupAuth = New-LauncherButton "Setup Auth"                     20 250 340 44 $PANEL $TEXT
-$btnClose     = New-LauncherButton "Close"                        380 250 340 44 $PANEL $TEXT
-$launcherForm.Controls.AddRange(@($btnOnboard, $btnOffboard, $btnHardMatch, $btnScan, $btnSetupAuth, $btnClose))
+$btnOnboard    = New-LauncherButton "Onboard User"                   20  80 340 70
+$btnOffboard   = New-LauncherButton "Offboard User"                 380  80 340 70 $DANGER
+$btnHardMatch  = New-LauncherButton "Hard-Match AD <-> Entra"         20 160 340 70 $GREEN $BG
+$btnScan       = New-LauncherButton "Scan Inactive Licensed Users"   380 160 340 70 $WARN  $BG
+$btnDisableComputers = New-LauncherButton "Disable Inactive AD Computers"  20 240 340 70 $PANEL $TEXT
+$btnDisableUsers     = New-LauncherButton "Disable Inactive AD Users"     380 240 340 70 $PANEL $TEXT
+$btnSetupAuth  = New-LauncherButton "Setup Auth"                     20 330 340 44 $PANEL $TEXT
+$btnClose      = New-LauncherButton "Close"                        380 330 340 44 $PANEL $TEXT
+$launcherForm.Controls.AddRange(@($btnOnboard, $btnOffboard, $btnHardMatch, $btnScan, $btnDisableComputers, $btnDisableUsers, $btnSetupAuth, $btnClose))
 
 $lblLogHead = New-Object System.Windows.Forms.Label
 $lblLogHead.Text = "Log"; $lblLogHead.ForeColor = $TEXTDIM; $lblLogHead.Font = $F_BOLD
-$lblLogHead.Location = New-Object System.Drawing.Point(20, 306); $lblLogHead.AutoSize = $true
+$lblLogHead.Location = New-Object System.Drawing.Point(20, 386); $lblLogHead.AutoSize = $true
 $launcherForm.Controls.Add($lblLogHead)
 
 $launcherLog = New-Object System.Windows.Forms.RichTextBox
-$launcherLog.Location = New-Object System.Drawing.Point(20, 328); $launcherLog.Size = New-Object System.Drawing.Size(700, 260)
+$launcherLog.Location = New-Object System.Drawing.Point(20, 408); $launcherLog.Size = New-Object System.Drawing.Size(700, 260)
 $launcherLog.Font = $F_MONO; $launcherLog.BackColor = [System.Drawing.Color]::FromArgb(10, 14, 22)
 $launcherLog.ForeColor = $TEXT; $launcherLog.ReadOnly = $true; $launcherLog.BorderStyle = "None"; $launcherLog.ScrollBars = "Vertical"
 $launcherForm.Controls.Add($launcherLog)
@@ -1274,6 +1550,8 @@ $btnOnboard.Add_Click({ Show-OnboardPage -Owner $launcherForm })
 $btnOffboard.Add_Click({ Show-OffboardPage -Owner $launcherForm })
 $btnHardMatch.Add_Click({ Show-HardMatchPage -Owner $launcherForm })
 $btnScan.Add_Click({ Show-ScanPage -Owner $launcherForm })
+$btnDisableComputers.Add_Click({ Show-ADCleanupPage -Owner $launcherForm -Kind 'Computer' })
+$btnDisableUsers.Add_Click({ Show-ADCleanupPage -Owner $launcherForm -Kind 'User' })
 
 $btnSetupAuth.Add_Click({
     $r = [System.Windows.Forms.MessageBox]::Show(
