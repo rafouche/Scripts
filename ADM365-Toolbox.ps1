@@ -28,9 +28,52 @@
     replacement.
 
     GUI mode : Run with no parameters - opens the launcher menu.
-    CLI mode : Supply -Tool plus that tool's own parameters (see each
-               original script's help for the full per-tool parameter list;
-               added in a later revision of this script).
+    CLI mode : Supply -Tool <Onboard|Offboard|HardMatch|ScanInactive> plus
+               that tool's own parameters to skip the launcher and dispatch
+               straight into the tool (NinjaRMM / scheduled task friendly).
+               Requires "Setup Auth" to have already been run once (GUI
+               mode) - CLI mode will not prompt for interactive sign-in.
+
+.PARAMETER Tool
+    Which tool to run headlessly: Onboard, Offboard, HardMatch, or
+    ScanInactive. Omit to open the GUI launcher instead.
+
+.PARAMETER FirstName
+.PARAMETER LastName
+.PARAMETER DisplayName
+.PARAMETER JobTitle
+.PARAMETER Department
+.PARAMETER Manager
+.PARAMETER PhoneNumber
+.PARAMETER TargetOU
+.PARAMETER ADGroups
+.PARAMETER LicenseSkuIds
+.PARAMETER TempPassword
+.PARAMETER NotifyEmail
+    -Tool Onboard parameters. Requires -FirstName and -LastName. -TargetOU
+    defaults to the domain's default Users container when omitted.
+
+.PARAMETER SamAccountName
+    -Tool Offboard (required) or -Tool HardMatch single-user mode
+    (required unless using -OUPath + -BatchMode). Same parameter, meaning
+    disambiguated by -Tool.
+
+.PARAMETER DelegateUsers
+.PARAMETER DistributionGroupMembers
+    -Tool Offboard parameters.
+
+.PARAMETER EntraUPN
+    -Tool HardMatch: Entra UPN to match to. Auto-resolved by UPN/mail if
+    omitted.
+
+.PARAMETER OUPath
+.PARAMETER BatchMode
+    -Tool HardMatch batch mode: DistinguishedName of an OU to recursively
+    scan and hard-match every enabled user in it. Requires both together.
+
+.PARAMETER InactiveDays
+    -Tool ScanInactive: inactivity threshold in days (default 90). Scans,
+    writes a CSV report, and exits - no remediation is performed in CLI mode.
 
 .PARAMETER AdminUPN
     UPN of the M365 admin for role verification.
@@ -47,14 +90,61 @@
 .EXAMPLE
     # GUI - opens the launcher menu
     .\ADM365-Toolbox.ps1
+
+.EXAMPLE
+    # CLI - onboard a new user, no GUI
+    .\ADM365-Toolbox.ps1 -Tool Onboard -FirstName "Jane" -LastName "Smith" -JobTitle "Accountant"
+
+.EXAMPLE
+    # CLI - offboard, WhatIf simulation
+    .\ADM365-Toolbox.ps1 -Tool Offboard -SamAccountName "jsmith" -WhatIf
+
+.EXAMPLE
+    # CLI - hard-match a single user
+    .\ADM365-Toolbox.ps1 -Tool HardMatch -SamAccountName "jsmith"
+
+.EXAMPLE
+    # CLI - headless inactive-user report for a scheduled task
+    .\ADM365-Toolbox.ps1 -Tool ScanInactive -InactiveDays 60
 #>
 
 [CmdletBinding()]
 param(
-    [string] $AdminUPN = "",
-    [switch] $SkipRoleCheck,
-    [switch] $SkipModuleCheck,
-    [switch] $WhatIf
+    [ValidateSet('Onboard', 'Offboard', 'HardMatch', 'ScanInactive')]
+    [string]   $Tool                     = "",
+
+    # --- Onboard (-Tool Onboard; requires -FirstName and -LastName) ---
+    [string]   $FirstName                = "",
+    [string]   $LastName                 = "",
+    [string]   $DisplayName              = "",
+    [string]   $JobTitle                 = "",
+    [string]   $Department               = "",
+    [string]   $Manager                  = "",
+    [string]   $PhoneNumber              = "",
+    [string]   $TargetOU                 = "",
+    [string[]] $ADGroups                 = @(),
+    [string[]] $LicenseSkuIds            = @(),
+    [string]   $TempPassword             = "",
+    [string]   $NotifyEmail              = "",
+
+    # --- Offboard (-Tool Offboard; requires -SamAccountName) ---
+    [string[]] $DelegateUsers            = @(),
+    [string[]] $DistributionGroupMembers = @(),
+
+    # --- HardMatch (-Tool HardMatch; requires -SamAccountName, or -OUPath + -BatchMode) ---
+    # -SamAccountName above is shared/contextual with Offboard - disambiguated by -Tool.
+    [string]   $EntraUPN                 = "",
+    [string]   $OUPath                   = "",
+    [switch]   $BatchMode,
+
+    # --- ScanInactive (-Tool ScanInactive) ---
+    [int]      $InactiveDays             = 90,
+
+    [string]   $SamAccountName           = "",
+    [string]   $AdminUPN                 = "",
+    [switch]   $SkipRoleCheck,
+    [switch]   $SkipModuleCheck,
+    [switch]   $WhatIf
 )
 
 # ============================================================
@@ -546,21 +636,28 @@ function Get-EnvironmentInfo {
         LocalDomain        = ""
         EmailDomain        = ""
         DisabledUsersOU    = ""
+        DefaultUserOU      = ""
+        UPNSuffixes        = @()
         AADConnectServer   = ""
         TenantName         = ""
         SharePointAdminURL = ""
     }
     try {
         $domain = Get-ADDomain -ErrorAction Stop
-        $info.DC          = $domain.PDCEmulator
-        $info.DomainDN    = $domain.DistinguishedName
-        $info.LocalDomain = $domain.DNSRoot
+        $info.DC             = $domain.PDCEmulator
+        $info.DomainDN       = $domain.DistinguishedName
+        $info.LocalDomain    = $domain.DNSRoot
+        $info.DefaultUserOU  = $domain.UsersContainer
 
         $forest = Get-ADForest -ErrorAction SilentlyContinue
         if ($forest -and $forest.UPNSuffixes.Count -gt 0) {
             $nonLocal = $forest.UPNSuffixes |
                 Where-Object { $_ -notmatch '\.local$' } | Select-Object -First 1
             $info.EmailDomain = if ($nonLocal) { $nonLocal } else { $forest.UPNSuffixes[0] }
+            $info.UPNSuffixes = @($forest.UPNSuffixes | Where-Object { $_ -notmatch '\.local$' })
+        }
+        if ($domain.DNSRoot -notmatch '\.local$' -and $info.UPNSuffixes -notcontains $domain.DNSRoot) {
+            $info.UPNSuffixes = @($domain.DNSRoot) + $info.UPNSuffixes
         }
         if ($info.EmailDomain -eq "") {
             $info.EmailDomain = Get-ADUser -Filter { Enabled -eq $true } `
@@ -5053,6 +5150,150 @@ function New-LauncherButton { param($t, $x, $y, $w, $h, $bg = $ACCENT, $fg = [Sy
     $b.Text = $t; $b.Location = New-Object System.Drawing.Point($x, $y); $b.Size = New-Object System.Drawing.Size($w, $h)
     $b.Font = New-Object System.Drawing.Font("Segoe UI Semibold", 11); $b.ForeColor = $fg; $b.BackColor = $bg
     $b.FlatStyle = "Flat"; $b.FlatAppearance.BorderSize = 0; $b
+}
+
+# ============================================================
+# CLI / NinjaRMM MODE
+# When -Tool is supplied, skip the launcher GUI entirely and dispatch
+# straight into that tool's own business-logic function(s) - the same
+# functions each page's GUI button ultimately calls, just driven from
+# parameters instead of a form. Mirrors each original standalone
+# script's own CLI dispatch block (Onboard-ADUser.ps1 line ~1612,
+# Offboard-ADUser.ps1 line ~1544, Set-ADEntraHardMatch.ps1 line
+# ~2202/2229, Find-InactiveLicensedUsers.ps1's -ReportOnly path).
+#
+# All 4 paths need a working non-interactive (cert-based) Graph
+# connection. Onboard/Offboard's Invoke-* functions call the shared
+# Connect-M365Graph internally, which falls back to an INTERACTIVE
+# sign-in if no cert config is present - fine for the GUI, but would
+# hang an unattended NinjaRMM run waiting on a browser prompt that will
+# never appear. Guard against that up front for every -Tool path,
+# matching the stricter check Set-ADEntraHardMatch.ps1's own CLI mode
+# already does.
+# ============================================================
+if ($Tool -ne "") {
+    if (-not (Get-CertConfig)) {
+        Write-Log "No non-interactive M365 auth is configured (ADM365Config.json missing/incomplete or cert expired). Run this toolbox once with no parameters and use 'Setup Auth' first." "ERROR"
+        exit 2
+    }
+
+    switch ($Tool) {
+        'Onboard' {
+            if ($FirstName -eq "" -or $LastName -eq "") {
+                Write-Log "-Tool Onboard requires -FirstName and -LastName." "ERROR"
+                exit 2
+            }
+            $ou = if ($TargetOU -ne "") { $TargetOU } else { $script:E.DefaultUserOU }
+            $ok = Invoke-Onboarding `
+                -FirstName        $FirstName `
+                -LastName         $LastName `
+                -DisplayName      $DisplayName `
+                -JobTitle         $JobTitle `
+                -Department       $Department `
+                -Manager          $Manager `
+                -PhoneNumber      $PhoneNumber `
+                -TargetOU         $ou `
+                -ADGroups         $ADGroups `
+                -LicenseSkuIds    $LicenseSkuIds `
+                -AADConnectServer $script:E.AADConnectServer `
+                -TempPassword     $TempPassword `
+                -NotifyEmail      $NotifyEmail `
+                -WhatIfMode       $WhatIf.IsPresent
+            exit $(if ($ok) { 0 } else { 1 })
+        }
+
+        'Offboard' {
+            if ($SamAccountName -eq "") {
+                Write-Log "-Tool Offboard requires -SamAccountName." "ERROR"
+                exit 2
+            }
+            $ok = Invoke-Offboarding `
+                -SamAccountName           $SamAccountName `
+                -DisabledUsersOU          $script:E.DisabledUsersOU `
+                -DelegateUsers            $DelegateUsers `
+                -DistributionGroupMembers $DistributionGroupMembers `
+                -AADConnectServer         $script:E.AADConnectServer `
+                -SharePointAdminURL       $script:E.SharePointAdminURL `
+                -WhatIfMode               $WhatIf.IsPresent
+            exit $(if ($ok) { 0 } else { 1 })
+        }
+
+        'HardMatch' {
+            if ($SamAccountName -eq "" -and -not ($OUPath -ne "" -and $BatchMode.IsPresent)) {
+                Write-Log "-Tool HardMatch requires -SamAccountName, or -OUPath plus -BatchMode." "ERROR"
+                exit 2
+            }
+            $null = Import-Module Microsoft.Graph.Users -ErrorAction SilentlyContinue
+
+            if ($SamAccountName -ne "" -and -not $BatchMode.IsPresent) {
+                Write-Log "CLI single-user mode: SAM=$SamAccountName" "INFO"
+                try {
+                    $adUser = Get-ADUser -Identity $SamAccountName `
+                        -Properties DisplayName, SamAccountName, UserPrincipalName, EmailAddress, ObjectGUID, DistinguishedName `
+                        -ErrorAction Stop
+                } catch {
+                    Write-Log "AD user not found: $SamAccountName - $(Get-SafeErrorText $_)" "ERROR"
+                    exit 2
+                }
+
+                $res = Resolve-EntraCandidate -ADUser $adUser
+                if ($res.Confidence -eq 'None' -and $EntraUPN -eq "") {
+                    Write-Log "No Entra match found for $SamAccountName and no -EntraUPN supplied." "ERROR"
+                    exit 2
+                }
+
+                $entraUser = if ($EntraUPN -ne "") {
+                    try { Get-MgUser -UserId $EntraUPN -Property Id, DisplayName, UserPrincipalName, AccountEnabled, OnPremisesImmutableId -ErrorAction Stop }
+                    catch { Write-Log "Entra user not found: $EntraUPN - $(Get-SafeErrorText $_)" "ERROR"; exit 2 }
+                } else { $res.EntraUser }
+
+                $result = Invoke-HardMatch -ADUser $adUser -EntraUser $entraUser -WhatIfMode $WhatIf.IsPresent -AllowConflictUI $false
+                Write-Log "Result: $result" $(if ($result -eq 'OK' -or $result -eq 'AlreadyMatched') { "SUCCESS" } else { "ERROR" })
+                exit $(if ($result -eq 'OK' -or $result -eq 'AlreadyMatched' -or $result -eq 'WhatIf') { 0 } else { 1 })
+            }
+
+            if ($OUPath -ne "" -and $BatchMode.IsPresent) {
+                Write-Log "CLI batch mode: OU=$OUPath" "INFO"
+                try {
+                    $adUsers = @(Get-ADUser -SearchBase $OUPath -SearchScope Subtree -Filter { Enabled -eq $true } `
+                        -Properties DisplayName, SamAccountName, UserPrincipalName, EmailAddress, ObjectGUID, DistinguishedName `
+                        -ErrorAction Stop | Sort-Object DisplayName)
+                } catch {
+                    Write-Log "Failed to load AD users from ${OUPath}: $(Get-SafeErrorText $_)" "ERROR"
+                    exit 2
+                }
+                Write-Log "Loaded $($adUsers.Count) enabled AD user(s)." "INFO"
+                $okCount = 0; $skipCount = 0; $failCount = 0
+                foreach ($u in $adUsers) {
+                    Write-Log "--- $($u.DisplayName) [$($u.SamAccountName)] ---" "INFO"
+                    $res = Resolve-EntraCandidate -ADUser $u
+                    if ($res.Confidence -eq 'None') { Write-Log "  No Entra match - skipped." "WARN"; $skipCount++; continue }
+                    $result = Invoke-HardMatch -ADUser $u -EntraUser $res.EntraUser -WhatIfMode $WhatIf.IsPresent -AllowConflictUI $false
+                    switch ($result) {
+                        'OK'             { $okCount++ }
+                        'AlreadyMatched' { $skipCount++ }
+                        'WhatIf'         { $skipCount++ }
+                        default          { $failCount++ }
+                    }
+                }
+                Write-Log "CLI batch complete: $okCount matched, $skipCount skipped, $failCount failed." $(if ($failCount -gt 0) { "WARN" } else { "SUCCESS" })
+                exit $(if ($failCount -gt 0) { 1 } else { 0 })
+            }
+        }
+
+        'ScanInactive' {
+            try {
+                $candidates = Get-InactiveLicensedUsers -InactiveDays $InactiveDays
+                $reportPath = Join-Path (Split-Path $PSCommandPath -Parent) "InactiveUserScan_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+                Export-ScanReport -Candidates $candidates -Path $reportPath
+                Write-Log "Report written: $reportPath ($($candidates.Count) account(s))" "SUCCESS"
+                exit 0
+            } catch {
+                Write-Log "Scan failed: $(Get-SafeErrorText $_)" "ERROR"
+                exit 1
+            }
+        }
+    }
 }
 
 $launcherForm = New-Object System.Windows.Forms.Form
