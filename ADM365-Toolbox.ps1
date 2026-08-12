@@ -1221,11 +1221,1105 @@ $BORDER  = [System.Drawing.Color]::FromArgb(45,  56,  80)
 
 $F_NORM  = New-Object System.Drawing.Font("Segoe UI", 9)
 $F_BOLD  = New-Object System.Drawing.Font("Segoe UI Semibold", 9)
+$F_SM    = New-Object System.Drawing.Font("Segoe UI", 8)
 $F_MONO  = New-Object System.Drawing.Font("Consolas", 8.5)
 $F_TITLE = New-Object System.Drawing.Font("Segoe UI Semibold", 14)
 
 # ---- Stub pages (replaced one at a time as each tool is ported in) ----
-function Show-OnboardPage    { param($Owner) Write-Log "Onboard page not yet implemented in the combined toolbox - use Onboard-ADUser.ps1 directly for now." "WARN" $script:launcherLog }
+function Invoke-Onboarding {
+    param(
+        [string]   $FirstName,
+        [string]   $LastName,
+        [string]   $DisplayName,
+        [string]   $JobTitle,
+        [string]   $Department,
+        [string]   $Manager,
+        [string]   $PhoneNumber,
+        [string]   $TargetOU,
+        [string[]] $ADGroups,
+        [string[]] $LicenseSkuIds,
+        [string]   $AADConnectServer,
+        [string]   $TempPassword,
+        [string]   $NotifyEmail,
+        [string]   $UPNSuffix = "",
+        [bool]     $WhatIfMode,
+        [System.Windows.Forms.RichTextBox] $LogBox      = $null,
+        [System.Windows.Forms.ProgressBar] $ProgressBar = $null,
+        [System.Windows.Forms.Label]       $StatusLabel = $null
+    )
+
+    function Prog { param([int]$p, [string]$m)
+        if ($ProgressBar) { $ProgressBar.Value = [Math]::Min($p, 100) }
+        if ($StatusLabel) { $StatusLabel.Text  = $m }
+        [System.Windows.Forms.Application]::DoEvents()
+    }
+
+    function Step { param([string]$d, [scriptblock]$a)
+        if ($WhatIfMode) { Write-Log "[WHATIF] $d" "WARN" $LogBox }
+        else             { Write-Log $d "INFO" $LogBox; & $a }
+    }
+
+    try {
+        # Step 1 - Derive account values
+        Write-Log ">> 1/7 - Generate account details" "HEAD" $LogBox
+        Prog 8 "Generating account details..."
+
+        $dispName = if ($DisplayName) { $DisplayName } else { "$FirstName $LastName" }
+        $samName  = New-SamAccountName -First $FirstName -Last $LastName
+        # Use explicitly selected suffix, fall back to auto-discovered email domain
+        $suffix   = if ($UPNSuffix) { $UPNSuffix } else { $script:E.EmailDomain }
+        $upn      = "$samName@$suffix"
+        $password = if ($TempPassword) { $TempPassword } else { New-TempPassword }
+        $secPwd   = ConvertTo-SecureString $password -AsPlainText -Force
+
+        Write-Log "Display Name : $dispName"  "INFO" $LogBox
+        Write-Log "SAM Account  : $samName"    "INFO" $LogBox
+        Write-Log "UPN          : $upn"        "INFO" $LogBox
+        Write-Log "Target OU    : $TargetOU"   "INFO" $LogBox
+
+        # Step 2 - Create AD account
+        Write-Log ">> 2/7 - Create AD user account" "HEAD" $LogBox
+        Prog 18 "Creating AD account..."
+
+        Step "New-ADUser: $samName" {
+            $params = @{
+                Name                  = $dispName
+                GivenName             = $FirstName
+                Surname               = $LastName
+                DisplayName           = $dispName
+                SamAccountName        = $samName
+                UserPrincipalName     = $upn
+                EmailAddress          = $upn
+                AccountPassword       = $secPwd
+                ChangePasswordAtLogon = $false
+                PasswordNeverExpires  = $true
+                Enabled               = $true
+                Path                  = $TargetOU
+            }
+            if ($JobTitle)    { $params.Title       = $JobTitle }
+            if ($Department)  { $params.Department  = $Department }
+            if ($PhoneNumber) { $params.OfficePhone = $PhoneNumber }
+
+            New-ADUser @params
+
+            # Set mail and proxyAddresses BEFORE sync so Exchange picks them up correctly
+            # mail attribute = EmailAddress (already set above via -EmailAddress)
+            # proxyAddresses: uppercase SMTP: = primary, must be set separately
+            Set-ADUser -Identity $samName -Add @{
+                proxyAddresses = [string[]]@("SMTP:$upn")
+            }
+
+            if ($Manager) {
+                try {
+                    $mgrObj = Get-ADUser -Identity $Manager -ErrorAction Stop
+                    Set-ADUser -Identity $samName -Manager $mgrObj.DistinguishedName
+                    Write-Log "Manager set: $($mgrObj.DisplayName)" "SUCCESS" $LogBox
+                }
+                catch { Write-Log "Manager not found ($Manager) - skipped." "WARN" $LogBox }
+            }
+
+            Write-Log "AD account created: $samName" "SUCCESS" $LogBox
+        }
+
+        # Step 3 - Add to AD groups
+        Write-Log ">> 3/7 - AD group membership" "HEAD" $LogBox
+        Prog 30 "Adding to AD groups..."
+
+        foreach ($grp in $ADGroups) {
+            # Domain Users is the automatic primary group for all AD accounts -
+            # it cannot be added via Add-ADGroupMember and the warning is harmless but confusing
+            if ($grp -eq "Domain Users") {
+                Write-Log "Domain Users - automatic primary group, skipping explicit add." "INFO" $LogBox
+                continue
+            }
+            Step "Add to group: $grp" {
+                try {
+                    Add-ADGroupMember -Identity $grp -Members $samName -ErrorAction Stop
+                    Write-Log "Added to: $grp" "SUCCESS" $LogBox
+                }
+                catch { Write-Log "Group not found ($grp): $_" "WARN" $LogBox }
+            }
+        }
+        if ($ADGroups.Count -eq 0) {
+            Write-Log "No AD groups specified." "WARN" $LogBox
+        }
+
+        # Step 4 - Entra sync
+        Write-Log ">> 4/7 - Entra delta sync (push new account)" "HEAD" $LogBox
+        Prog 45 "Triggering Entra sync..."
+
+        if ($AADConnectServer) {
+            Step "Delta sync - $AADConnectServer" {
+                $isLocal = ($AADConnectServer -eq $env:COMPUTERNAME) -or
+                           ($AADConnectServer -eq "localhost") -or
+                           ($AADConnectServer -eq "127.0.0.1")
+                if ($isLocal) {
+                    # ADSync depends on System.Web (.NET Framework only).
+                    # In PS7 (.NET 6+) we must delegate to a powershell.exe (PS5.1) subprocess.
+                    if ($PSVersionTable.PSVersion.Major -ge 7) {
+                        $syncOut = powershell.exe -NoProfile -ExecutionPolicy Bypass `
+                            -Command "Import-Module ADSync -ErrorAction Stop; Start-ADSyncSyncCycle -PolicyType Delta" 2>&1
+                        if ($LASTEXITCODE -ne 0) {
+                            throw "ADSync local sync failed (exit $LASTEXITCODE): $syncOut"
+                        }
+                    } else {
+                        Import-Module ADSync -ErrorAction Stop
+                        Start-ADSyncSyncCycle -PolicyType Delta | Out-Null
+                    }
+                } else {
+                    # Remote: Invoke-Command targets PS5.1 on the remote server - ADSync works fine
+                    Invoke-Command -ComputerName $AADConnectServer -ScriptBlock {
+                        Import-Module ADSync -ErrorAction Stop
+                        Start-ADSyncSyncCycle -PolicyType Delta | Out-Null
+                    }
+                }
+                # Give sync 45s to propagate to Entra before polling begins
+                Write-Log "Sync triggered - waiting 45s then polling Entra (up to 6 min)..." "INFO" $LogBox
+                Start-Sleep -Seconds 45
+            }
+        } else {
+            Write-Log "No AADConnect server - skipping sync." "WARN" $LogBox
+            Write-Log "Trigger manually before license assignment." "WARN" $LogBox
+        }
+
+        # Step 5 - Connect Graph
+        Write-Log ">> Connecting Microsoft Graph" "HEAD" $LogBox
+        Prog 58 "Connecting to M365..."
+
+        Step "Connect Graph" { Connect-M365Graph }
+
+        # Step 6 - Assign licenses
+        Write-Log ">> 5/7 - Assign M365 licenses" "HEAD" $LogBox
+        Prog 68 "Assigning M365 licenses..."
+
+        if ($LicenseSkuIds.Count -gt 0) {
+            Step "Assign licenses to $upn" {
+                # Use Invoke-MgGraphRequest (always available in Graph.Authentication)
+                # instead of Set-MgUserLicense which requires Graph.Users to be resolvable
+                $mgUser  = $null
+                $retries = 0
+                while (-not $mgUser -and $retries -lt 36) {
+                    Start-Sleep -Seconds 10
+                    try {
+                        $result = Invoke-MgGraphRequest -Method GET `
+                            -Uri "https://graph.microsoft.com/v1.0/users?`$filter=userPrincipalName eq '$upn'&`$select=id" `
+                            -ErrorAction SilentlyContinue
+                        if ($result -and $result.value -and $result.value.Count -gt 0) {
+                            $mgUser = $result.value[0]
+                        }
+                    } catch {}
+                    $retries++
+                    if (-not $mgUser -and $retries % 6 -eq 0) {
+                        Write-Log "  Still waiting for user in Entra... ($($retries * 10)s elapsed)" "WARN" $LogBox
+                    }
+                }
+
+                if ($mgUser) {
+                    # Set usage location (required before license assignment).
+                    # Read from config so non-US clients work correctly.
+                    $uLoc = if ($script:Config['UsageLocation']) { $script:Config['UsageLocation'] } else { 'US' }
+                    Invoke-MgGraphRequest -Method PATCH `
+                        -Uri "https://graph.microsoft.com/v1.0/users/$($mgUser.id)" `
+                        -Body (@{ usageLocation = $uLoc } | ConvertTo-Json) `
+                        -ContentType "application/json" -ErrorAction Stop | Out-Null
+                    Write-Log "Usage location set to: $uLoc" "INFO" $LogBox
+
+                    # Wait for usageLocation to propagate -- Graph requires it before assignLicense
+                    Write-Log "Waiting 10s for usage location to propagate..." "INFO" $LogBox
+                    Start-Sleep -Seconds 10
+
+                    # Assign licenses via REST
+                    $licBody = @{
+                        addLicenses    = @($LicenseSkuIds | ForEach-Object { @{ skuId = $_ } })
+                        removeLicenses = @()
+                    } | ConvertTo-Json -Depth 5
+                    Invoke-MgGraphRequest -Method POST `
+                        -Uri "https://graph.microsoft.com/v1.0/users/$($mgUser.id)/assignLicense" `
+                        -Body $licBody -ContentType "application/json" -ErrorAction Stop | Out-Null
+                    Write-Log "Assigned $($LicenseSkuIds.Count) license(s) to $upn" "SUCCESS" $LogBox
+                }
+                else {
+                    Write-Log "User $upn not found in Entra after $($retries * 10)s - license skipped." "WARN" $LogBox
+                }
+            }
+        }
+        else { Write-Log "No licenses selected - skipping license assignment." "WARN" $LogBox }
+
+        # Step 7 - Welcome notification
+        Write-Log ">> 6/7 - Welcome notification" "HEAD" $LogBox
+        Prog 85 "Sending welcome notification..."
+
+        if ($NotifyEmail -ne "") {
+            Step "Send credential email to $NotifyEmail" {
+                Connect-M365Exchange
+
+                $licNames = $LicenseSkuIds | ForEach-Object {
+                    $id = $_
+                    $m  = $script:CachedLicenses | Where-Object { $_.SkuId -eq $id } | Select-Object -First 1
+                    if ($m) { $m.FriendlyName } else { $id }
+                }
+
+                $bodyText = "New User Account Created`r`n`r`n" +
+                    "Display Name  : $dispName`r`n" +
+                    "Username (SAM): $samName`r`n" +
+                    "UPN / Email   : $upn`r`n" +
+                    "Temp Password : $password`r`n" +
+                    "Target OU     : $TargetOU`r`n" +
+                    "AD Groups     : $($ADGroups -join ', ')`r`n" +
+                    "Licenses      : $($licNames -join ', ')`r`n`r`n" +
+                    "The user must change their password at first login.`r`n" +
+                    "Please provide these credentials securely.`r`n`r`n" +
+                    "IT Administration`r`n"
+                Send-MailMessage -To $NotifyEmail -Subject "New Account: $dispName" `
+                    -Body $bodyText -SmtpServer "smtp.office365.com" -Port 587 `
+                    -UseSsl -Credential (Get-Credential -Message "SMTP credentials") `
+                    -ErrorAction SilentlyContinue
+                Write-Log "Notification sent to $NotifyEmail" "SUCCESS" $LogBox
+            }
+        }
+        else { Write-Log "No notify address - skipping welcome email." "INFO" $LogBox }
+
+        # Done
+        Prog 100 "Complete."
+        Write-Log "" "INFO" $LogBox
+        Write-Log "============================================" "SUCCESS" $LogBox
+        Write-Log " ONBOARDING COMPLETE" "SUCCESS" $LogBox
+        Write-Log " Name     : $dispName" "SUCCESS" $LogBox
+        Write-Log " SAM      : $samName" "SUCCESS" $LogBox
+        Write-Log " UPN      : $upn" "SUCCESS" $LogBox
+        Write-Log " Password : $password  (RECORD THIS NOW)" "SUCCESS" $LogBox
+        Write-Log " Groups   : $($ADGroups -join ', ')" "SUCCESS" $LogBox
+        Write-Log " Licenses : $($LicenseSkuIds.Count) assigned" "SUCCESS" $LogBox
+        if ($WhatIfMode) { Write-Log " *** WHATIF - no changes were made ***" "WARN" $LogBox }
+        Write-Log "============================================" "SUCCESS" $LogBox
+
+        $script:LastResult = @{
+            DisplayName = $dispName
+            SAM         = $samName
+            UPN         = $upn
+            Password    = $password
+        }
+
+        return $true
+    }
+    catch {
+        Write-Log "FATAL: $_" "ERROR" $LogBox
+        Prog 0 "Error - see log."
+        return $false
+    }
+}
+
+function ON-Lbl { param($t, $x, $y, $w = 200, $h = 22, $f = $F_NORM, $c = $TEXT)
+    $l = New-Object System.Windows.Forms.Label
+    $l.Text = $t; $l.Location = [System.Drawing.Point]::new($x, $y)
+    $l.Size = [System.Drawing.Size]::new($w, $h)
+    $l.Font = $f; $l.ForeColor = $c
+    $l.BackColor = [System.Drawing.Color]::Transparent; $l
+}
+function ON-TBox { param($x, $y, $w = 200, $h = 26, $pass = $false)
+    $t = New-Object System.Windows.Forms.TextBox
+    $t.Location = [System.Drawing.Point]::new($x, $y); $t.Size = [System.Drawing.Size]::new($w, $h)
+    $t.Font = $F_NORM; $t.ForeColor = $TEXT; $t.BackColor = $CLR_INPUT; $t.BorderStyle = "FixedSingle"
+    if ($pass) { $t.UseSystemPasswordChar = $true }; $t
+}
+function ON-TBoxML { param($x, $y, $w, $h)
+    $t = New-Object System.Windows.Forms.TextBox
+    $t.Location = [System.Drawing.Point]::new($x, $y); $t.Size = [System.Drawing.Size]::new($w, $h)
+    $t.Font = $F_NORM; $t.ForeColor = $TEXT; $t.BackColor = $CLR_INPUT; $t.BorderStyle = "FixedSingle"
+    $t.Multiline = $true; $t.ScrollBars = "Vertical"; $t
+}
+function ON-Btn { param($t, $x, $y, $w = 110, $h = 28, $bg = $ACCENT, $fg = $BG)
+    $b = New-Object System.Windows.Forms.Button
+    $b.Text = $t; $b.Location = [System.Drawing.Point]::new($x, $y); $b.Size = [System.Drawing.Size]::new($w, $h)
+    $b.Font = $F_BOLD; $b.ForeColor = $fg; $b.BackColor = $bg
+    $b.FlatStyle = "Flat"; $b.FlatAppearance.BorderSize = 0; $b.Cursor = "Hand"; $b
+}
+function ON-GBox { param($t, $x, $y, $w, $h)
+    $g = New-Object System.Windows.Forms.GroupBox
+    $g.Text = $t; $g.Location = [System.Drawing.Point]::new($x, $y); $g.Size = [System.Drawing.Size]::new($w, $h)
+    $g.Font = $F_BOLD; $g.ForeColor = $ACCENT; $g.BackColor = $PANEL; $g
+}
+
+function Show-ManagerSearch {
+    param([System.Windows.Forms.Form]$Parent = $null)
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = "Search for Manager"; $dlg.Size = [System.Drawing.Size]::new(620, 440)
+    $dlg.StartPosition = "CenterParent"; $dlg.BackColor = $BG
+    $dlg.FormBorderStyle = "FixedDialog"; $dlg.MaximizeBox = $false; $dlg.MinimizeBox = $false
+
+    $dlg.Controls.Add((ON-Lbl "Search by name, SAM, or email:" 10 10 400 22 $F_BOLD $TEXT))
+    $txtQ = ON-TBox 10 34 480 26; $dlg.Controls.Add($txtQ)
+    $btnGo = ON-Btn "Search" 500 32 96 28 $ACCENT $BG; $dlg.Controls.Add($btnGo)
+
+    $lv = New-Object System.Windows.Forms.ListView
+    $lv.Location = [System.Drawing.Point]::new(10, 68); $lv.Size = [System.Drawing.Size]::new(584, 272)
+    $lv.View = "Details"; $lv.FullRowSelect = $true; $lv.GridLines = $true
+    $lv.Font = $F_NORM; $lv.BackColor = $CLR_INPUT; $lv.ForeColor = $TEXT; $lv.BorderStyle = "FixedSingle"
+    [void]$lv.Columns.Add("Display Name", 200); [void]$lv.Columns.Add("SAM", 120)
+    [void]$lv.Columns.Add("Email", 200); [void]$lv.Columns.Add("Dept", 50)
+    $dlg.Controls.Add($lv)
+
+    $lblC   = ON-Lbl "" 10 348 400 20 $F_SM $TEXTDIM; $dlg.Controls.Add($lblC)
+    $btnOK  = ON-Btn "Select" 400 370 110 28 $GREEN $BG; $btnOK.Enabled = $false; $dlg.Controls.Add($btnOK)
+    $btnX   = ON-Btn "Cancel" 520 370 80 28 $BORDER $TEXT; $dlg.Controls.Add($btnX)
+
+    $script:SelectedManager = $null
+
+    $doSearch = {
+        $q = $txtQ.Text.Trim(); $lv.Items.Clear()
+        if ($q.Length -lt 2) { $lblC.Text = "Enter at least 2 characters."; return }
+        try {
+            $hits = Get-ADUser -Filter "(Name -like '*$q*') -or (SamAccountName -like '*$q*') -or (EmailAddress -like '*$q*')" `
+                -Properties DisplayName, EmailAddress, Department, Enabled |
+                Sort-Object DisplayName | Select-Object -First 100
+            foreach ($h in $hits) {
+                $item = New-Object System.Windows.Forms.ListViewItem("$($h.DisplayName)")
+                [void]$item.SubItems.Add("$($h.SamAccountName)")
+                [void]$item.SubItems.Add("$($h.EmailAddress)")
+                [void]$item.SubItems.Add("$($h.Department)")
+                $item.Tag = $h
+                if (-not $h.Enabled) { $item.ForeColor = $TEXTDIM }
+                [void]$lv.Items.Add($item)
+            }
+            $lblC.Text = "$($hits.Count) user(s) found."
+        }
+        catch { $lblC.Text = "Search error: $_" }
+    }
+
+    $btnGo.Add_Click($doSearch)
+    $txtQ.Add_KeyDown({ if ($_.KeyCode -eq "Return") { & $doSearch } })
+    $lv.Add_SelectedIndexChanged({ $btnOK.Enabled = ($lv.SelectedItems.Count -gt 0) })
+    $lv.Add_DoubleClick({
+            if ($lv.SelectedItems.Count -gt 0) {
+                $script:SelectedManager = $lv.SelectedItems[0].Tag
+                $dlg.DialogResult = "OK"; $dlg.Close()
+            }
+        })
+    $btnOK.Add_Click({
+            if ($lv.SelectedItems.Count -gt 0) {
+                $script:SelectedManager = $lv.SelectedItems[0].Tag
+                $dlg.DialogResult = "OK"; $dlg.Close()
+            }
+        })
+    $btnX.Add_Click({ $dlg.DialogResult = "Cancel"; $dlg.Close() })
+    $script:SelectedManager = $null
+    if ($Parent) { [void]$dlg.ShowDialog($Parent) } else { [void]$dlg.ShowDialog() }
+    $dlg.Dispose()
+}
+
+function Show-OUPicker {
+    param([System.Windows.Forms.Form]$Parent = $null)
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = "Select Target OU"; $dlg.Size = [System.Drawing.Size]::new(620, 500)
+    $dlg.StartPosition = "CenterParent"; $dlg.BackColor = $BG
+    $dlg.FormBorderStyle = "FixedDialog"; $dlg.MaximizeBox = $false; $dlg.MinimizeBox = $false
+
+    $dlg.Controls.Add((ON-Lbl "Select the OU for the new user account:" 10 10 580 22 $F_BOLD $TEXT))
+
+    $tv = New-Object System.Windows.Forms.TreeView
+    $tv.Location = [System.Drawing.Point]::new(10, 36); $tv.Size = [System.Drawing.Size]::new(584, 360)
+    $tv.BackColor = $CLR_INPUT; $tv.ForeColor = $TEXT; $tv.Font = $F_NORM; $tv.BorderStyle = "FixedSingle"
+    $dlg.Controls.Add($tv)
+
+    $lblSel = ON-Lbl "Selected: (none)" 10 404 584 20 $F_SM $TEXTDIM; $dlg.Controls.Add($lblSel)
+    $btnOK  = ON-Btn "Select" 390 426 100 28 $GREEN $BG; $btnOK.Enabled = $false; $dlg.Controls.Add($btnOK)
+    $btnX   = ON-Btn "Cancel" 500 426 90 28 $BORDER $TEXT; $dlg.Controls.Add($btnX)
+
+    $script:SelectedOU = ""
+
+    function Add-OUNode { param($parent, $dn)
+        $children = Get-ADOrganizationalUnit -Filter * -SearchBase $dn `
+            -SearchScope OneLevel -Properties Name | Sort-Object Name
+        foreach ($child in $children) {
+            $node = New-Object System.Windows.Forms.TreeNode($child.Name)
+            $node.Tag = $child.DistinguishedName
+            [void]$parent.Nodes.Add($node)
+            Add-OUNode $node $child.DistinguishedName
+        }
+    }
+
+    $rootNode = New-Object System.Windows.Forms.TreeNode($script:E.LocalDomain)
+    $rootNode.Tag = $script:E.DomainDN
+    [void]$tv.Nodes.Add($rootNode)
+    Add-OUNode $rootNode $script:E.DomainDN
+    $rootNode.Expand()
+
+    $tv.Add_AfterSelect({
+            if ($tv.SelectedNode -and $tv.SelectedNode.Tag) {
+                $script:SelectedOU = $tv.SelectedNode.Tag
+                $lblSel.Text = "Selected: $($script:SelectedOU)"
+                $btnOK.Enabled = $true
+            }
+        })
+
+    $btnOK.Add_Click({ $dlg.DialogResult = "OK"; $dlg.Close() })
+    $btnX.Add_Click({ $dlg.DialogResult = "Cancel"; $dlg.Close() })
+    $script:SelectedOU = ""
+    if ($Parent) { [void]$dlg.ShowDialog($Parent) } else { [void]$dlg.ShowDialog() }
+    $dlg.Dispose()
+}
+
+function Show-GroupPicker {
+    param([string[]]$AlreadySelected = @(), [System.Windows.Forms.Form]$Parent = $null)
+
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = "Select AD Security Groups"; $dlg.Size = [System.Drawing.Size]::new(680, 560)
+    $dlg.StartPosition = "CenterParent"; $dlg.BackColor = $BG
+    $dlg.FormBorderStyle = "FixedDialog"; $dlg.MaximizeBox = $false; $dlg.MinimizeBox = $false
+
+    $dlg.Controls.Add((ON-Lbl "Search and select groups for the new user:" 10 10 640 22 $F_BOLD $TEXT))
+    $txtQ   = ON-TBox 10 36 480 26; $dlg.Controls.Add($txtQ)
+    $btnGo  = ON-Btn "Search" 500 34 100 28 $ACCENT $BG; $dlg.Controls.Add($btnGo)
+    $dlg.Controls.Add((ON-Lbl "Available groups (check to select):" 10 70 400 20 $F_NORM $TEXTDIM))
+
+    $clb = New-Object System.Windows.Forms.CheckedListBox
+    $clb.Location = [System.Drawing.Point]::new(10, 92); $clb.Size = [System.Drawing.Size]::new(648, 340)
+    $clb.BackColor = $CLR_INPUT; $clb.ForeColor = $TEXT; $clb.Font = $F_NORM
+    $clb.BorderStyle = "FixedSingle"; $clb.CheckOnClick = $true
+    $dlg.Controls.Add($clb)
+
+    $lblCount = ON-Lbl "" 10 440 440 20 $F_SM $TEXTDIM; $dlg.Controls.Add($lblCount)
+    $btnOK    = ON-Btn "Confirm Selection" 370 464 180 28 $GREEN $BG; $dlg.Controls.Add($btnOK)
+    $btnX     = ON-Btn "Cancel" 560 464 90 28 $BORDER $TEXT; $dlg.Controls.Add($btnX)
+
+    # Lock Domain Users so it can never be unchecked
+    $clb.Add_ItemCheck({
+        if ($clb.Items[$_.Index] -eq "Domain Users") {
+            $_.NewValue = [System.Windows.Forms.CheckState]::Checked
+        }
+    })
+
+    $loadGroups = {
+        param($filter = "")
+        $clb.Items.Clear()
+        # Domain Users is mandatory - always pinned at top, always checked
+        $idx = $clb.Items.Add("Domain Users"); $clb.SetItemChecked($idx, $true)
+        try {
+            $groups = if ($filter) {
+                Get-ADGroup -Filter "Name -like '$filter' -and GroupCategory -eq 'Security'" |
+                    Where-Object { $_.Name -ne "Domain Users" } |
+                    Sort-Object Name | Select-Object -First 200
+            }
+            else {
+                Get-ADGroup -Filter { GroupCategory -eq "Security" } |
+                    Where-Object { $_.Name -ne "Domain Users" } |
+                    Sort-Object Name | Select-Object -First 200
+            }
+            foreach ($g in $groups) {
+                $idx = $clb.Items.Add($g.Name)
+                if ($AlreadySelected -contains $g.Name) { $clb.SetItemChecked($idx, $true) }
+            }
+            $lblCount.Text = "$(1 + $groups.Count) group(s) shown. Domain Users always required."
+        }
+        catch { $lblCount.Text = "Error: $_" }
+    }
+
+    & $loadGroups ""
+
+    $btnGo.Add_Click({
+            $q = $txtQ.Text.Trim()
+            $filter = if ($q) { "*$q*" } else { "" }
+            & $loadGroups $filter
+        })
+    $txtQ.Add_KeyDown({ if ($_.KeyCode -eq "Return") { $btnGo.PerformClick() } })
+
+    $btnOK.Add_Click({
+            # Always include Domain Users regardless of what was checked
+            $others = @($clb.CheckedItems | Where-Object { $_ -ne "Domain Users" })
+            $script:SelectedGroups = @("Domain Users") + $others
+            $dlg.DialogResult = "OK"; $dlg.Close()
+        })
+    $btnX.Add_Click({ $dlg.DialogResult = "Cancel"; $dlg.Close() })
+    if ($Parent) { [void]$dlg.ShowDialog($Parent) } else { [void]$dlg.ShowDialog() }
+    $dlg.Dispose()
+}
+
+function Show-LicensePicker {
+    param([System.Windows.Forms.Form]$Parent = $null)
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = "Select M365 Licenses"; $dlg.Size = [System.Drawing.Size]::new(700, 500)
+    $dlg.StartPosition = "CenterParent"; $dlg.BackColor = $BG
+    $dlg.FormBorderStyle = "FixedDialog"; $dlg.MaximizeBox = $false; $dlg.MinimizeBox = $false
+
+    $dlg.Controls.Add((ON-Lbl "Available licenses in your tenant (check to assign):" 10 10 640 22 $F_BOLD $TEXT))
+    $dlg.Controls.Add((ON-Lbl "Dimmed items = 0 seats available." 10 30 640 18 $F_SM $TEXTDIM))
+
+    $lv = New-Object System.Windows.Forms.ListView
+    $lv.Location = [System.Drawing.Point]::new(10, 54); $lv.Size = [System.Drawing.Size]::new(668, 350)
+    $lv.View = "Details"; $lv.CheckBoxes = $true; $lv.FullRowSelect = $true; $lv.GridLines = $true
+    $lv.Font = $F_NORM; $lv.BackColor = $CLR_INPUT; $lv.ForeColor = $TEXT; $lv.BorderStyle = "FixedSingle"
+    [void]$lv.Columns.Add("License Name", 300)
+    [void]$lv.Columns.Add("SKU", 160)
+    [void]$lv.Columns.Add("Available", 90)
+    [void]$lv.Columns.Add("Total", 90)
+    $dlg.Controls.Add($lv)
+
+    foreach ($lic in $script:CachedLicenses) {
+        $item = New-Object System.Windows.Forms.ListViewItem($lic.FriendlyName)
+        [void]$item.SubItems.Add($lic.SkuPartNumber)
+        [void]$item.SubItems.Add($lic.Available.ToString())
+        [void]$item.SubItems.Add($lic.Total.ToString())
+        $item.Tag = $lic.SkuId
+        if ($lic.Available -le 0) { $item.ForeColor = $TEXTDIM }
+        [void]$lv.Items.Add($item)
+    }
+
+    if ($script:CachedLicenses.Count -eq 0) {
+        $dlg.Controls.Add((ON-Lbl "No licenses found - check M365 connection." 10 410 640 22 $F_BOLD $WARN))
+    }
+
+    $btnRefresh = ON-Btn "Refresh" 10 414 110 28 $PANEL $ACCENT; $dlg.Controls.Add($btnRefresh)
+    $btnOK      = ON-Btn "Assign Selected" 390 414 180 28 $GREEN $BG; $dlg.Controls.Add($btnOK)
+    $btnX       = ON-Btn "Cancel" 580 414 90 28 $BORDER $TEXT; $dlg.Controls.Add($btnX)
+
+    # Pre-check any licenses that were previously selected (so Cancel preserves the selection)
+    for ($i = 0; $i -lt $lv.Items.Count; $i++) {
+        $skuId     = $lv.Items[$i].Tag
+        $alreadySel = @($script:SelectedLicenses | Where-Object { $_['SkuId'] -eq $skuId })
+        if ($alreadySel.Count -gt 0) { $lv.Items[$i].Checked = $true }
+    }
+
+    $btnRefresh.Add_Click({
+            $lv.Items.Clear()
+            $script:CachedLicenses = Get-M365Licenses -Silent:$false
+            foreach ($lic in $script:CachedLicenses) {
+                $item = New-Object System.Windows.Forms.ListViewItem($lic.FriendlyName)
+                [void]$item.SubItems.Add($lic.SkuPartNumber)
+                [void]$item.SubItems.Add($lic.Available.ToString())
+                [void]$item.SubItems.Add($lic.Total.ToString())
+                $item.Tag = $lic.SkuId
+                if ($lic.Available -le 0) { $item.ForeColor = $TEXTDIM }
+                [void]$lv.Items.Add($item)
+            }
+        })
+
+    $btnOK.Add_Click({
+            # Only update SelectedLicenses on OK - Cancel leaves it unchanged
+            $script:SelectedLicenses = @(
+                $lv.CheckedItems | ForEach-Object { @{ SkuId = $_.Tag; FriendlyName = $_.Text } }
+            )
+            $dlg.DialogResult = "OK"; $dlg.Close()
+        })
+    $btnX.Add_Click({ $dlg.DialogResult = "Cancel"; $dlg.Close() })
+    if ($Parent) { [void]$dlg.ShowDialog($Parent) } else { [void]$dlg.ShowDialog() }
+    $dlg.Dispose()
+}
+
+$script:SelectedOU       = ""
+$script:SelectedGroups   = @("Domain Users")
+$script:SelectedLicenses = @()
+$script:SelectedManager  = $null
+$script:LastResult       = $null
+
+function Show-OnboardPage {
+    param($Owner)
+    try {
+$form = New-Object System.Windows.Forms.Form
+$form.Text = "AD/M365 User Onboarding Tool"
+$form.Size = [System.Drawing.Size]::new(860, 660)
+$form.StartPosition = "CenterParent"; $form.BackColor = $BG
+$form.FormBorderStyle = "Sizable"; $form.MaximizeBox = $true; $form.Font = $F_NORM
+$form.MinimumSize = [System.Drawing.Size]::new(800, 560)
+
+# Scrollable content panel - all content goes here so bottom buttons always visible
+$pnlScroll = New-Object System.Windows.Forms.Panel
+$pnlScroll.Dock = "Fill"
+$pnlScroll.AutoScroll = $true
+$pnlScroll.BackColor = $BG
+
+# Title strip
+$pnlTitle = New-Object System.Windows.Forms.Panel
+$pnlTitle.Location = [System.Drawing.Point]::new(0, 0); $pnlTitle.Size = [System.Drawing.Size]::new(860, 52)
+$pnlTitle.BackColor = [System.Drawing.Color]::FromArgb(12, 16, 24)
+$pnlTitle.Controls.Add((ON-Lbl "  [ONBOARD]  AD/M365 User Onboarding Tool" 0 8 560 34 $F_TITLE $GREEN))
+$pnlTitle.Controls.Add((ON-Lbl "Domain: $($script:E.LocalDomain)   Tenant: $($script:E.TenantName)" 574 18 276 20 $F_NORM $TEXTDIM))
+$pnlScroll.Controls.Add($pnlTitle)
+
+# Status banner
+$pnlBanner = New-Object System.Windows.Forms.Panel
+$pnlBanner.Location = [System.Drawing.Point]::new(0, 52); $pnlBanner.Size = [System.Drawing.Size]::new(860, 24)
+$pnlBanner.BackColor = [System.Drawing.Color]::FromArgb(0, 55, 18)
+$licCount  = $script:CachedLicenses.Count
+$lblBanner = ON-Lbl "  [OK] Modules verified   [OK] M365 roles verified   [OK] $licCount license SKU(s) loaded" 0 3 860 18 $F_NORM $GREEN
+$pnlBanner.Controls.Add($lblBanner)
+$pnlScroll.Controls.Add($pnlBanner)
+
+# Section: User Information
+$grpInfo = ON-GBox "New User Information" 10 84 838 134
+$pnlScroll.Controls.Add($grpInfo)
+
+$grpInfo.Controls.Add((ON-Lbl "First Name *" 10 24 100 20 $F_BOLD $TEXT))
+$txtFirst = ON-TBox 10 44 160 26; $grpInfo.Controls.Add($txtFirst)
+
+$grpInfo.Controls.Add((ON-Lbl "Last Name *" 182 24 100 20 $F_BOLD $TEXT))
+$txtLast = ON-TBox 182 44 160 26; $grpInfo.Controls.Add($txtLast)
+
+$grpInfo.Controls.Add((ON-Lbl "Display Name" 354 24 120 20 $F_BOLD $TEXT))
+$txtDisp = ON-TBox 354 44 200 26; $txtDisp.ForeColor = $TEXTDIM; $grpInfo.Controls.Add($txtDisp)
+
+$grpInfo.Controls.Add((ON-Lbl "Job Title" 566 24 100 20 $F_BOLD $TEXT))
+$txtTitle = ON-TBox 566 44 252 26; $grpInfo.Controls.Add($txtTitle)
+
+$grpInfo.Controls.Add((ON-Lbl "Department" 10 78 100 20 $F_BOLD $TEXT))
+$txtDept = ON-TBox 10 96 200 26; $grpInfo.Controls.Add($txtDept)
+
+$grpInfo.Controls.Add((ON-Lbl "Phone" 222 78 80 20 $F_BOLD $TEXT))
+$txtPhone = ON-TBox 222 96 160 26; $grpInfo.Controls.Add($txtPhone)
+
+$grpInfo.Controls.Add((ON-Lbl "Manager" 394 78 80 20 $F_BOLD $TEXT))
+$txtMgr = ON-TBox 394 96 200 26; $txtMgr.ForeColor = $TEXTDIM; $txtMgr.ReadOnly = $true
+$grpInfo.Controls.Add($txtMgr)
+$btnMgrSearch = ON-Btn "Search" 602 94 70 28 $PANEL $ACCENT; $grpInfo.Controls.Add($btnMgrSearch)
+
+$grpInfo.Controls.Add((ON-Lbl "Notify Email" 684 78 100 20 $F_BOLD $TEXT))
+$txtNotify = ON-TBox 684 96 144 26; $grpInfo.Controls.Add($txtNotify)
+
+# Auto-fill display name
+$updateDisp = {
+    $f = $txtFirst.Text.Trim(); $l = $txtLast.Text.Trim()
+    if ($txtDisp.ForeColor.ToArgb() -eq $TEXTDIM.ToArgb()) {
+        $txtDisp.Text = "$f $l".Trim()
+    }
+}
+$txtFirst.Add_TextChanged($updateDisp)
+$txtLast.Add_TextChanged($updateDisp)
+$txtDisp.Add_Enter({
+        if ($txtDisp.ForeColor.ToArgb() -eq $TEXTDIM.ToArgb()) {
+            $txtDisp.Text = ""; $txtDisp.ForeColor = $TEXT
+        }
+    })
+
+# Section: Account Preview
+$grpAcct = ON-GBox "Generated Account Details  (auto-derived)" 10 226 838 96
+$pnlScroll.Controls.Add($grpAcct)
+
+$grpAcct.Controls.Add((ON-Lbl "SAM Account:" 10 26 100 20 $F_BOLD $TEXT))
+$lblSAM = ON-Lbl "(enter name above)" 114 26 180 20 $F_MONO $ACCENT; $grpAcct.Controls.Add($lblSAM)
+
+$grpAcct.Controls.Add((ON-Lbl "UPN / Email:" 306 26 100 20 $F_BOLD $TEXT))
+$lblUPN = ON-Lbl "" 410 26 280 20 $F_MONO $ACCENT; $grpAcct.Controls.Add($lblUPN)
+
+$grpAcct.Controls.Add((ON-Lbl "Temp Password:" 700 26 116 20 $F_BOLD $TEXT))
+$lblPwd = ON-Lbl (New-TempPassword) 700 46 130 20 $F_MONO $WARN; $grpAcct.Controls.Add($lblPwd)
+$btnNewPwd = ON-Btn "New" 830 44 18 24 $PANEL $TEXTDIM; $grpAcct.Controls.Add($btnNewPwd)
+
+$grpAcct.Controls.Add((ON-Lbl "UPN Suffix:" 10 60 90 22 $F_BOLD $TEXT))
+$cmbSuffix = New-Object System.Windows.Forms.ComboBox
+$cmbSuffix.Location    = [System.Drawing.Point]::new(104, 58)
+$cmbSuffix.Size        = [System.Drawing.Size]::new(280, 26)
+$cmbSuffix.Font        = $F_NORM; $cmbSuffix.ForeColor = $TEXT; $cmbSuffix.BackColor = $CLR_INPUT
+$cmbSuffix.DropDownStyle = "DropDownList"
+foreach ($sfx in $script:E.UPNSuffixes) { [void]$cmbSuffix.Items.Add($sfx) }
+if ($cmbSuffix.Items.Count -eq 0) { [void]$cmbSuffix.Items.Add($script:E.EmailDomain) }
+$cmbSuffix.SelectedIndex = 0
+$grpAcct.Controls.Add($cmbSuffix)
+$grpAcct.Controls.Add((ON-Lbl "(email domain for UPN and primary SMTP - sets mail + proxyAddresses before sync)" 396 62 438 18 $F_SM $TEXTDIM))
+
+# Usage location (ISO 3166-1 alpha-2) -- required by M365 before license assignment
+$grpAcct.Controls.Add((ON-Lbl "Usage Location:" 700 58 116 22 $F_BOLD $TEXT))
+$txtUsageLoc = New-Object System.Windows.Forms.TextBox
+$txtUsageLoc.Location  = [System.Drawing.Point]::new(820, 58)
+$txtUsageLoc.Size      = [System.Drawing.Size]::new(40, 24)
+$txtUsageLoc.Font      = $F_NORM; $txtUsageLoc.ForeColor = $TEXT; $txtUsageLoc.BackColor = $CLR_INPUT
+$txtUsageLoc.MaxLength = 2
+$txtUsageLoc.Text      = if ($script:Config['UsageLocation']) { $script:Config['UsageLocation'] } else { 'US' }
+$grpAcct.Controls.Add($txtUsageLoc)
+
+$updatePreview = {
+    $f = $txtFirst.Text.Trim(); $l = $txtLast.Text.Trim()
+    $sfx = if ($cmbSuffix.SelectedItem) { $cmbSuffix.SelectedItem } else { $script:E.EmailDomain }
+    if ($f.Length -gt 0 -and $l.Length -gt 0) {
+        try {
+            $sam = New-SamAccountName -First $f -Last $l
+            $lblSAM.Text = $sam
+            $lblUPN.Text = "$sam@$sfx"
+        }
+        catch { $lblSAM.Text = "(error)"; $lblUPN.Text = "" }
+    }
+    else { $lblSAM.Text = "(enter name above)"; $lblUPN.Text = "" }
+}
+$txtFirst.Add_TextChanged($updatePreview)
+$txtLast.Add_TextChanged($updatePreview)
+$cmbSuffix.Add_SelectedIndexChanged({
+        & $updatePreview
+        # Persist selected suffix to config
+        if ($cmbSuffix.SelectedItem) {
+            $script:Config['DefaultUPNSuffix'] = $cmbSuffix.SelectedItem
+            Save-Config
+        }
+    })
+
+$btnNewPwd.Add_Click({ $lblPwd.Text = New-TempPassword })
+
+# Section: Target OU
+$grpOU = ON-GBox "Target OU  (auto-discovered - click Browse to change)" 10 308 838 66
+$pnlScroll.Controls.Add($grpOU)
+
+$grpOU.Controls.Add((ON-Lbl "OU:" 10 28 30 22 $F_BOLD $TEXT))
+$txtOU = New-Object System.Windows.Forms.TextBox
+$txtOU.Location = [System.Drawing.Point]::new(44, 24); $txtOU.Size = [System.Drawing.Size]::new(680, 26)
+$txtOU.Font = $F_NORM; $txtOU.ForeColor = $TEXT; $txtOU.BackColor = $CLR_INPUT; $txtOU.BorderStyle = "FixedSingle"
+$txtOU.Text = $script:E.DefaultUserOU
+$grpOU.Controls.Add($txtOU)
+$btnBrowseOU = ON-Btn "Browse" 732 22 92 28 $PANEL $ACCENT; $grpOU.Controls.Add($btnBrowseOU)
+
+# Section: AD Groups
+$grpGrps = ON-GBox "AD Security Groups" 10 382 414 144
+$pnlScroll.Controls.Add($grpGrps)
+
+$clbGroups = New-Object System.Windows.Forms.CheckedListBox
+$clbGroups.Location = [System.Drawing.Point]::new(10, 20); $clbGroups.Size = [System.Drawing.Size]::new(290, 112)
+$clbGroups.BackColor = $CLR_INPUT; $clbGroups.ForeColor = $TEXT; $clbGroups.Font = $F_NORM
+$clbGroups.BorderStyle = "FixedSingle"; $clbGroups.CheckOnClick = $true
+$grpGrps.Controls.Add($clbGroups)
+
+# Domain Users is always required - pre-add as locked
+[void]$clbGroups.Items.Add("Domain Users", $true)
+
+$btnBrowseGroups = ON-Btn "Browse Groups" 308 20 96 30 $PANEL $ACCENT; $grpGrps.Controls.Add($btnBrowseGroups)
+$btnClearGroups  = ON-Btn "Clear" 308 58 96 28 $PANEL $DANGER; $grpGrps.Controls.Add($btnClearGroups)
+$lblGrpCount     = ON-Lbl "0 selected" 308 94 96 20 $F_SM $TEXTDIM; $grpGrps.Controls.Add($lblGrpCount)
+
+# Section: M365 Licenses
+$grpLic = ON-GBox "M365 Licenses" 434 382 414 144
+$pnlScroll.Controls.Add($grpLic)
+
+$clbLicenses = New-Object System.Windows.Forms.CheckedListBox
+$clbLicenses.Location = [System.Drawing.Point]::new(10, 20); $clbLicenses.Size = [System.Drawing.Size]::new(290, 112)
+$clbLicenses.BackColor = $CLR_INPUT; $clbLicenses.ForeColor = $TEXT; $clbLicenses.Font = $F_NORM
+$clbLicenses.BorderStyle = "FixedSingle"; $clbLicenses.CheckOnClick = $true
+$grpLic.Controls.Add($clbLicenses)
+
+foreach ($lic in $script:CachedLicenses) {
+    $display = "$($lic.FriendlyName) ($($lic.Available) avail)"
+    [void]$clbLicenses.Items.Add($display)
+}
+
+$btnBrowseLic = ON-Btn "Browse Licenses" 308 20 96 30 $PANEL $ACCENT; $grpLic.Controls.Add($btnBrowseLic)
+$btnClearLic  = ON-Btn "Clear" 308 58 96 28 $PANEL $DANGER; $grpLic.Controls.Add($btnClearLic)
+$lblLicCount  = ON-Lbl "0 selected" 308 94 96 20 $F_SM $TEXTDIM; $grpLic.Controls.Add($lblLicCount)
+
+# -- Restore saved defaults from config --------------------------------
+# OU
+if ($script:Config['DefaultOU'] -and $script:Config['DefaultOU'] -ne "") {
+    $txtOU.Text = $script:Config['DefaultOU']
+}
+
+# UPN Suffix - restore saved selection
+$savedSuffix = $script:Config['DefaultUPNSuffix']
+if ($savedSuffix -and $savedSuffix -ne "") {
+    $idx = $cmbSuffix.Items.IndexOf($savedSuffix)
+    if ($idx -ge 0) { $cmbSuffix.SelectedIndex = $idx }
+}
+
+# AD Groups (Domain Users already added; restore any additional saved groups)
+$savedGroups = $script:Config['DefaultGroups']
+if ($savedGroups -and $savedGroups -ne "") {
+    foreach ($g in ($savedGroups -split ',')) {
+        $g = $g.Trim()
+        if ($g -ne "" -and $g -ne "Domain Users") {
+            [void]$clbGroups.Items.Add($g, $true)
+            $script:SelectedGroups += $g
+        }
+    }
+    $lblGrpCount.Text = "$($clbGroups.CheckedItems.Count) selected"
+}
+
+# Licenses - re-check any saved SKUs in the license list
+$savedSkus = $script:Config['DefaultLicenseSkuIds']
+if ($savedSkus -and $savedSkus -ne "") {
+    $skuList = $savedSkus -split ','
+    for ($i = 0; $i -lt $script:CachedLicenses.Count; $i++) {
+        if ($skuList -contains $script:CachedLicenses[$i].SkuId) {
+            $clbLicenses.SetItemChecked($i, $true)
+            $script:SelectedLicenses += @{ SkuId = $script:CachedLicenses[$i].SkuId; FriendlyName = $script:CachedLicenses[$i].FriendlyName }
+        }
+    }
+    $lblLicCount.Text = "$(@($script:SelectedLicenses).Count) selected"
+}
+# ---------------------------------------------------------------------
+
+# Section: AD and Sync
+$grpAD = ON-GBox "AD and Sync  (auto-discovered - edit if needed)" 10 534 838 64
+$pnlScroll.Controls.Add($grpAD)
+
+$grpAD.Controls.Add((ON-Lbl "AADConnect Server:" 10 28 140 22 $F_BOLD $TEXT))
+$txtAADC = ON-TBox 154 24 200 26; $txtAADC.Text = $script:E.AADConnectServer; $grpAD.Controls.Add($txtAADC)
+
+$chkWhatIf = New-Object System.Windows.Forms.CheckBox
+$chkWhatIf.Text = "WhatIf - simulation only (no changes)"
+$chkWhatIf.Location = [System.Drawing.Point]::new(370, 28); $chkWhatIf.Size = [System.Drawing.Size]::new(310, 24)
+$chkWhatIf.Font = $F_BOLD; $chkWhatIf.ForeColor = $WARN
+$chkWhatIf.BackColor = [System.Drawing.Color]::Transparent
+$grpAD.Controls.Add($chkWhatIf)
+
+# Progress and log
+$progress = New-Object System.Windows.Forms.ProgressBar
+$progress.Location = [System.Drawing.Point]::new(10, 608); $progress.Size = [System.Drawing.Size]::new(838, 16)
+$progress.Minimum = 0; $progress.Maximum = 100; $progress.ForeColor = $GREEN; $progress.BackColor = $PANEL
+$pnlScroll.Controls.Add($progress)
+
+$lblStatus = ON-Lbl "Ready - complete the fields above and click Run Onboarding." 10 628 838 20 $F_NORM $TEXTDIM
+$pnlScroll.Controls.Add($lblStatus)
+
+$logBox = New-Object System.Windows.Forms.RichTextBox
+$logBox.Location = [System.Drawing.Point]::new(10, 650); $logBox.Size = [System.Drawing.Size]::new(838, 96)
+$logBox.Font = $F_MONO; $logBox.BackColor = [System.Drawing.Color]::FromArgb(10, 14, 22)
+$logBox.ForeColor = $TEXT; $logBox.ReadOnly = $true; $logBox.BorderStyle = "None"; $logBox.ScrollBars = "Vertical"
+$pnlScroll.Controls.Add($logBox)
+
+if ($script:StartupLog -and $script:StartupLog.Count -gt 0) {
+    Write-Log "--- Startup log (module bootstrap / Graph version-skew repair / role check) ---" "INFO" $logBox
+    foreach ($entry in $script:StartupLog) {
+        $mappedLevel = switch ($entry.Level) { "OK" { "SUCCESS" } "ERR" { "ERROR" } "WARN" { "WARN" } default { "INFO" } }
+        Write-Log $entry.Message $mappedLevel $logBox
+    }
+    Write-Log "--- End startup log ---" "INFO" $logBox
+}
+
+# Bottom bar
+$pnlBot = New-Object System.Windows.Forms.Panel
+$pnlBot.Dock = "Bottom"; $pnlBot.Height = 52
+$pnlBot.BackColor = [System.Drawing.Color]::FromArgb(12, 16, 24)
+$form.Controls.Add($pnlBot)
+$form.Controls.Add($pnlScroll)
+
+$btnRun     = ON-Btn "Run Onboarding"   10  10 185 34 $GREEN  $BG
+$btnRun.Font = New-Object System.Drawing.Font("Segoe UI Semibold", 10)
+$btnExport   = ON-Btn "Export Log"       206  12 130 30 $BORDER $TEXT
+$btnRecheck  = ON-Btn "Re-check Setup"   346  12 160 30 $PANEL  $ACCENT
+$btnSetupAuth= ON-Btn "Setup Auth"       516  12 140 30 $PANEL  $WARN
+$btnClose    = ON-Btn "Close"            740  12 100 30 $DANGER ([System.Drawing.Color]::White)
+$pnlBot.Controls.AddRange(@($btnRun, $btnExport, $btnRecheck, $btnSetupAuth, $btnClose))
+
+# ============================================================
+# EVENTS
+# ============================================================
+
+$btnMgrSearch.Add_Click({
+        Show-ManagerSearch -Parent $form
+        if ($script:SelectedManager) {
+            $txtMgr.ForeColor = $TEXT
+            $txtMgr.Text = $script:SelectedManager.SamAccountName
+            $txtMgr.Tag  = $script:SelectedManager.SamAccountName
+        }
+    })
+
+$btnBrowseOU.Add_Click({
+        Show-OUPicker -Parent $form
+        if ($script:SelectedOU) {
+            $txtOU.Text = $script:SelectedOU
+            $script:Config['DefaultOU'] = $script:SelectedOU
+            Save-Config
+        }
+    })
+
+$btnBrowseGroups.Add_Click({
+        $current = @($clbGroups.CheckedItems | Where-Object { $_ -ne "Domain Users" })
+        Show-GroupPicker -AlreadySelected $current -Parent $form
+        $clbGroups.Items.Clear()
+        # Domain Users always first, always checked
+        [void]$clbGroups.Items.Add("Domain Users", $true)
+        foreach ($g in ($script:SelectedGroups | Where-Object { $_ -ne "Domain Users" })) {
+            [void]$clbGroups.Items.Add($g, $true)
+        }
+        $lblGrpCount.Text = "$($clbGroups.CheckedItems.Count) selected"
+        # Persist to config (Domain Users is implicit - stored separately)
+        $extras = @($script:SelectedGroups | Where-Object { $_ -ne "Domain Users" })
+        $script:Config['DefaultGroups'] = $extras -join ','
+        Save-Config
+    })
+
+$btnClearGroups.Add_Click({
+        # Clear all except Domain Users (always required)
+        $clbGroups.Items.Clear()
+        [void]$clbGroups.Items.Add("Domain Users", $true)
+        $lblGrpCount.Text = "1 selected"
+    })
+$clbGroups.Add_ItemCheck({
+        # Domain Users can never be unchecked
+        if ($clbGroups.Items[$_.Index] -eq "Domain Users") {
+            $_.NewValue = [System.Windows.Forms.CheckState]::Checked
+        }
+        $lblGrpCount.Text = "$($clbGroups.CheckedItems.Count) selected"
+    })
+
+$btnBrowseLic.Add_Click({
+        Show-LicensePicker -Parent $form
+        $clbLicenses.Items.Clear()
+        foreach ($lic in $script:CachedLicenses) {
+            $display    = "$($lic.FriendlyName) ($($lic.Available) avail)"
+            $idx        = $clbLicenses.Items.Add($display)
+            $isSelected = (@($script:SelectedLicenses | Where-Object { $_['SkuId'] -eq $lic.SkuId })).Count -gt 0
+            $clbLicenses.SetItemChecked($idx, $isSelected)
+        }
+        $lblLicCount.Text = "$(@($script:SelectedLicenses).Count) selected"
+        # Persist license selection to config
+        $script:Config['DefaultLicenseSkuIds'] = (@($script:SelectedLicenses) | ForEach-Object { $_['SkuId'] }) -join ','
+        Save-Config
+    })
+
+$btnClearLic.Add_Click({
+        for ($i = 0; $i -lt $clbLicenses.Items.Count; $i++) { $clbLicenses.SetItemChecked($i, $false) }
+        $script:SelectedLicenses = @(); $lblLicCount.Text = "0 selected"
+    })
+$clbLicenses.Add_ItemCheck({ $lblLicCount.Text = "$($clbLicenses.CheckedItems.Count) selected" })
+
+$btnRun.Add_Click({
+        $fn = $txtFirst.Text.Trim(); $ln = $txtLast.Text.Trim(); $ou = $txtOU.Text.Trim()
+        if ($fn -eq "" -or $ln -eq "" -or $ou -eq "") {
+            [System.Windows.Forms.MessageBox]::Show(
+                "First Name, Last Name, and Target OU are required.",
+                "Missing Fields", "OK", "Warning"); return
+        }
+
+        $selGroups  = @($clbGroups.CheckedItems | ForEach-Object { $_ })
+        $selLicSkus = @()
+        for ($i = 0; $i -lt $clbLicenses.Items.Count; $i++) {
+            if ($clbLicenses.GetItemChecked($i) -and $i -lt $script:CachedLicenses.Count) {
+                $selLicSkus += $script:CachedLicenses[$i].SkuId
+            }
+        }
+        if ($selLicSkus.Count -eq 0 -and (@($script:SelectedLicenses)).Count -gt 0) {
+            $selLicSkus = @($script:SelectedLicenses | ForEach-Object { $_['SkuId'] })
+        }
+
+        $licNames = @($selLicSkus | ForEach-Object {
+                $id = $_; $m = $script:CachedLicenses | Where-Object { $_.SkuId -eq $id } | Select-Object -First 1
+                if ($m) { $m.FriendlyName } else { $id }
+            })
+
+        $wi      = $chkWhatIf.Checked
+        $dispVal = if ($txtDisp.ForeColor.ToArgb() -eq $TEXTDIM.ToArgb() -or $txtDisp.Text.Trim() -eq "") { "" } else { $txtDisp.Text.Trim() }
+        $mgrVal  = if ($txtMgr.Tag) { $txtMgr.Tag } else { $txtMgr.Text.Trim() }
+        $pwdVal  = $lblPwd.Text.Trim()
+
+        $msg = "Create new user:`n`n" +
+            "  Name       : $fn $ln`n" +
+            "  Title      : $($txtTitle.Text.Trim())`n" +
+            "  Department : $($txtDept.Text.Trim())`n" +
+            "  Manager    : $(if ($mgrVal) { $mgrVal } else { '(none)' })`n" +
+            "  Target OU  : $ou`n" +
+            "  AD Groups  : $(if ($selGroups.Count) { $selGroups -join ', ' } else { '(none)' })`n" +
+            "  Licenses   : $(if ($licNames.Count) { $licNames -join ', ' } else { '(none)' })`n" +
+            "  WhatIf     : $wi`n`n" +
+            "$(if ($wi) { 'SIMULATION - no changes will be made.' } else { 'THIS WILL CREATE A LIVE ACCOUNT. Proceed?' })"
+
+        if ([System.Windows.Forms.MessageBox]::Show($msg, "Confirm Onboarding", "YesNo", "Question") -ne "Yes") { return }
+
+        $btnRun.Enabled = $false; $logBox.Clear()
+
+        # Persist usage location from GUI field before invoking (engine reads $script:Config)
+        $uLocVal = $txtUsageLoc.Text.Trim().ToUpper()
+        if ($uLocVal.Length -eq 2) {
+            $script:Config['UsageLocation'] = $uLocVal
+            Save-Config
+        }
+
+        $ok = Invoke-Onboarding `
+            -FirstName        $fn `
+            -LastName         $ln `
+            -DisplayName      $dispVal `
+            -JobTitle         $txtTitle.Text.Trim() `
+            -Department       $txtDept.Text.Trim() `
+            -Manager          $mgrVal `
+            -PhoneNumber      $txtPhone.Text.Trim() `
+            -TargetOU         $ou `
+            -ADGroups         $selGroups `
+            -LicenseSkuIds    $selLicSkus `
+            -AADConnectServer $txtAADC.Text.Trim() `
+            -TempPassword     $pwdVal `
+            -NotifyEmail      $txtNotify.Text.Trim() `
+            -UPNSuffix        ($cmbSuffix.SelectedItem) `
+            -WhatIfMode       $wi `
+            -LogBox           $logBox `
+            -ProgressBar      $progress `
+            -StatusLabel      $lblStatus
+
+        $btnRun.Enabled = $true
+
+        if ($ok) {
+            $lblStatus.ForeColor = $GREEN; $lblStatus.Text = "[OK]  Onboarding complete."
+            if (-not $wi -and $script:LastResult) {
+                $summary = "Onboarding complete!`n`n" +
+                    "Display Name  : $($script:LastResult.DisplayName)`n" +
+                    "SAM Account   : $($script:LastResult.SAM)`n" +
+                    "UPN / Email   : $($script:LastResult.UPN)`n" +
+                    "Temp Password : $($script:LastResult.Password)`n`n" +
+                    "Password must be changed at first login.`n" +
+                    "Copy it now - it will not be shown again."
+                [System.Windows.Forms.MessageBox]::Show($summary, "Account Created", "OK", "Information")
+            }
+        }
+        else { $lblStatus.ForeColor = $DANGER; $lblStatus.Text = "[X]  Error - see log." }
+    })
+
+$btnRecheck.Add_Click({
+        $lblBanner.ForeColor = $WARN
+        $lblBanner.Text = "  [...]  Re-checking modules, roles, and licenses..."
+        $pnlBanner.BackColor = [System.Drawing.Color]::FromArgb(60, 40, 0)
+        [System.Windows.Forms.Application]::DoEvents()
+        try {
+            Invoke-ModuleBootstrap -Silent:$false
+            Invoke-RoleBootstrap -AdminUPN $AdminUPN -Silent:$false
+            $script:CachedLicenses = Get-M365Licenses -Silent:$false
+            $clbLicenses.Items.Clear()
+            foreach ($lic in $script:CachedLicenses) {
+                [void]$clbLicenses.Items.Add("$($lic.FriendlyName) ($($lic.Available) avail)")
+            }
+            $lblBanner.ForeColor = $GREEN
+            $lblBanner.Text = "  [OK] Modules verified   [OK] M365 roles verified   [OK] $($script:CachedLicenses.Count) license SKU(s) loaded"
+            $pnlBanner.BackColor = [System.Drawing.Color]::FromArgb(0, 55, 18)
+        }
+        catch {
+            $lblBanner.ForeColor = $DANGER; $lblBanner.Text = "  [X]  Setup issue - see console."
+            $pnlBanner.BackColor = [System.Drawing.Color]::FromArgb(60, 0, 0)
+        }
+    })
+
+$btnExport.Add_Click({
+        $dlg = New-Object System.Windows.Forms.SaveFileDialog
+        $dlg.Title = "Export Log"; $dlg.Filter = "Text (*.txt)|*.txt|All|*.*"
+        $dlg.FileName = "Onboard-$(Get-Date -Format 'yyyyMMdd-HHmmss').txt"
+        if ($dlg.ShowDialog() -eq "OK") {
+            $logBox.Text | Set-Content $dlg.FileName -Encoding UTF8
+            Write-Log "Log exported: $($dlg.FileName)" "SUCCESS" $logBox
+        }
+    })
+
+$btnSetupAuth.Add_Click({
+        $cfg = Get-CertConfig
+        if ($cfg) {
+            $ans = [System.Windows.Forms.MessageBox]::Show(
+                "Non-interactive auth is already configured.`n`n" +
+                "App ID  : $($cfg.AppId)`n" +
+                "Cert    : $($cfg.CertThumbprint)`n`n" +
+                "Run setup again to replace it?",
+                "Auth Already Configured", "YesNo", "Question")
+            if ($ans -ne "Yes") { return }
+        }
+        $btnSetupAuth.Enabled = $false
+        $logBox.Clear()
+        $ok = Initialize-M365Auth -LogBox $logBox
+        $btnSetupAuth.Enabled = $true
+        if ($ok) {
+            $lblStatus.ForeColor = $GREEN
+            $lblStatus.Text = "[OK] Non-interactive auth configured. Wait 5-10 min then re-check setup."
+        } else {
+            $lblStatus.ForeColor = $DANGER
+            $lblStatus.Text = "[X] Setup Auth failed - see log."
+        }
+    })
+
+$btnClose.Add_Click({ $form.Close() })
+
+    [void]$form.ShowDialog($Owner)
+    } catch {
+        [System.Windows.Forms.MessageBox]::Show(
+            "A startup error occurred:`n`n$_`n`nLine: $($_.InvocationInfo.ScriptLineNumber)",
+            "Startup Error", "OK", "Error") | Out-Null
+    }
+}
 function Invoke-Offboarding {
     param(
         [string]   $SamAccountName,
@@ -2546,7 +3640,7 @@ function Show-EntraPicker {
 # ---------------------------------------------------------------
 # 4  OU TREE PICKER DIALOG
 # ---------------------------------------------------------------
-function Show-OUPicker {
+function Show-OnboardOUPicker {
     $dlg = [System.Windows.Forms.Form]::new()
     $dlg.Text            = 'Select OU for Batch Scan'
     $dlg.Width           = 560; $dlg.Height = 480
@@ -3026,7 +4120,7 @@ function Show-HardMatchPage {
 
     # OU browse
     $btnPickOU.Add_Click({
-        $ou = Show-OUPicker
+        $ou = Show-OnboardOUPicker
         if ($ou) {
             $txtOU.Text = $ou
             $script:Config['DefaultOU'] = $ou
