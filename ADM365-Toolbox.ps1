@@ -323,7 +323,11 @@ function Repair-GraphModuleVersionSkew {
         if ($script:StartupLog) { $script:StartupLog.Add([PSCustomObject]@{ Level = $l; Message = $m }) }
     }
 
-    $graphModules = @("Microsoft.Graph.Authentication", "Microsoft.Graph.Users", "Microsoft.Graph.Applications", "Microsoft.Graph.Identity.DirectoryManagement")
+    # Groups/Sites don't participate in the specific Authentication+Applications+
+    # Identity.DirectoryManagement conflict (nothing explicitly imports them with an
+    # unpinned version the way those three get imported together), but keeping the whole
+    # Graph module family aligned is cheap and avoids ever needing to re-diagnose this.
+    $graphModules = @("Microsoft.Graph.Authentication", "Microsoft.Graph.Users", "Microsoft.Graph.Applications", "Microsoft.Graph.Identity.DirectoryManagement", "Microsoft.Graph.Groups", "Microsoft.Graph.Sites")
 
     RGL "Resolving a pinned Microsoft.Graph module version for this family (avoids ambiguous version resolution instead of trying to remove old copies)..."
 
