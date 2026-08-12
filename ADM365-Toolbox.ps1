@@ -1217,6 +1217,7 @@ $WARN    = [System.Drawing.Color]::FromArgb(240, 165,   0)
 $DANGER  = [System.Drawing.Color]::FromArgb(210,  55,  55)
 $TEXT    = [System.Drawing.Color]::FromArgb(215, 225, 240)
 $TEXTDIM = [System.Drawing.Color]::FromArgb(110, 128, 160)
+$BORDER  = [System.Drawing.Color]::FromArgb(45,  56,  80)
 
 $F_NORM  = New-Object System.Drawing.Font("Segoe UI", 9)
 $F_BOLD  = New-Object System.Drawing.Font("Segoe UI Semibold", 9)
@@ -1225,7 +1226,704 @@ $F_TITLE = New-Object System.Drawing.Font("Segoe UI Semibold", 14)
 
 # ---- Stub pages (replaced one at a time as each tool is ported in) ----
 function Show-OnboardPage    { param($Owner) Write-Log "Onboard page not yet implemented in the combined toolbox - use Onboard-ADUser.ps1 directly for now." "WARN" $script:launcherLog }
-function Show-OffboardPage   { param($Owner) Write-Log "Offboard page not yet implemented in the combined toolbox - use Offboard-ADUser.ps1 directly for now." "WARN" $script:launcherLog }
+function Invoke-Offboarding {
+    param(
+        [string]   $SamAccountName,
+        [string]   $DisabledUsersOU,
+        [string[]] $DelegateUsers,
+        [string[]] $DistributionGroupMembers,
+        [string]   $AADConnectServer,
+        [string]   $SharePointAdminURL,
+        [bool]     $WhatIfMode,
+        [System.Windows.Forms.RichTextBox] $LogBox      = $null,
+        [System.Windows.Forms.ProgressBar] $ProgressBar = $null,
+        [System.Windows.Forms.Label]       $StatusLabel = $null
+    )
+
+    function Prog { param([int]$p, [string]$m)
+        if ($ProgressBar) { $ProgressBar.Value = [Math]::Min($p, 100) }
+        if ($StatusLabel) { $StatusLabel.Text  = $m }
+        [System.Windows.Forms.Application]::DoEvents()
+    }
+
+    function Step { param([string]$d, [scriptblock]$a)
+        if ($WhatIfMode) { Write-Log "[WHATIF] $d" "WARN" $LogBox }
+        else             { Write-Log $d "INFO" $LogBox; & $a }
+    }
+
+    try {
+        # Step 1 - Resolve user
+        Write-Log ">> 1/12 - Resolve AD user" "HEAD" $LogBox
+        Prog 5 "Resolving user..."
+
+        $u = Get-ADUser -Identity $SamAccountName `
+            -Properties DisplayName, EmailAddress, UserPrincipalName, DistinguishedName `
+            -ErrorAction Stop
+
+        $origDN    = $u.DistinguishedName
+        $origSam   = $u.SamAccountName
+        $origDisp  = $u.DisplayName
+        $origMail  = $u.EmailAddress
+        $origUPN   = $u.UserPrincipalName
+        $upnSuffix = $origUPN.Split("@")[1]
+        $localPart = $origUPN.Split("@")[0]
+
+        Write-Log "Found: $origDisp | $origMail" "SUCCESS" $LogBox
+
+        # Step 2 - Build renamed values
+        $newDisp  = "Historical - $origDisp"
+        $newLocal = "Historical-$localPart"
+        $newSam   = if ($newLocal.Length -gt 20) { $newLocal.Substring(0, 20) } else { $newLocal }
+        $newUPN   = "$newLocal@$upnSuffix"
+        $newMail  = "$newLocal@$upnSuffix"
+        Write-Log "Rename display  -> $newDisp" "INFO" $LogBox
+        Write-Log "Rename UPN      -> $newUPN"  "INFO" $LogBox
+
+        # Step 3 - Rename AD
+        Write-Log ">> 2/12 - Rename AD object" "HEAD" $LogBox
+        Prog 10 "Renaming AD attributes..."
+
+        Step "Set-ADUser + Rename-ADObject" {
+            Set-ADUser -Identity $origSam `
+                -DisplayName $newDisp -SamAccountName $newSam `
+                -UserPrincipalName $newUPN -EmailAddress $newMail
+            Rename-ADObject -Identity $origDN -NewName $newDisp
+        }
+
+        if (-not $WhatIfMode) {
+            Start-Sleep -Seconds 2
+            $u = Get-ADUser -Identity $newSam `
+                -Properties DisplayName, EmailAddress, UserPrincipalName, DistinguishedName
+            Write-Log "Renamed OK. DN: $($u.DistinguishedName)" "SUCCESS" $LogBox
+        }
+
+        # Step 4 - Sync #1: push rename so Exchange sees the Historical display name
+        Write-Log ">> 3/12 - Entra sync #1 (push rename)" "HEAD" $LogBox
+        Prog 18 "Triggering Entra sync #1..."
+
+        if ($AADConnectServer) {
+            Step "Delta sync #1 - $AADConnectServer" {
+                $isLocal = ($AADConnectServer -eq $env:COMPUTERNAME) -or
+                           ($AADConnectServer -eq "localhost") -or
+                           ($AADConnectServer -eq "127.0.0.1")
+                if ($isLocal) {
+                    # ADSync depends on System.Web (.NET Framework only).
+                    # In PS7 (.NET 6+) we must run it in a powershell.exe (PS5.1) subprocess.
+                    if ($PSVersionTable.PSVersion.Major -ge 7) {
+                        $syncOut = powershell.exe -NoProfile -ExecutionPolicy Bypass `
+                            -Command "Import-Module ADSync -ErrorAction Stop; Start-ADSyncSyncCycle -PolicyType Delta" 2>&1
+                        if ($LASTEXITCODE -ne 0) {
+                            throw "ADSync local sync failed (exit $LASTEXITCODE): $syncOut"
+                        }
+                    } else {
+                        Import-Module ADSync -ErrorAction Stop
+                        Start-ADSyncSyncCycle -PolicyType Delta | Out-Null
+                    }
+                } else {
+                    # Remote: Invoke-Command targets the server's default PS session (PS5.1) - ADSync works fine
+                    Invoke-Command -ComputerName $AADConnectServer -ScriptBlock {
+                        Import-Module ADSync -ErrorAction Stop
+                        Start-ADSyncSyncCycle -PolicyType Delta | Out-Null
+                    }
+                }
+                Write-Log "Sync #1 triggered - waiting 60s..." "INFO" $LogBox
+                Start-Sleep -Seconds 60
+            }
+        }
+        else { Write-Log "No AADConnect server - skipping sync #1." "WARN" $LogBox }
+
+        # Step 5 - Connect M365 BEFORE disabling the AD account.
+        # The mailbox must be converted while the user still exists and is licensed in Entra.
+        Write-Log ">> 4/12 - Connect Exchange Online and Microsoft Graph" "HEAD" $LogBox
+        Prog 26 "Connecting to M365..."
+
+        Step "Connect Graph" {
+            # Only connect Graph in-process. All EXO operations use Invoke-EXOProcess
+            # (separate powershell.exe child) to avoid the Azure.Core/MSAL DLL conflict.
+            Connect-M365Graph
+        }
+
+        # Steps 6, 7, 8 - Shared mailbox, permissions, distribution group
+        # ALL Exchange Online cmdlets run in a child powershell.exe process to avoid
+        # the Azure.Core / MSAL DLL conflict with Microsoft.Graph in this session.
+        Write-Log ">> 5-7/12 - Exchange: Shared mailbox + permissions + distribution group" "HEAD" $LogBox
+        Prog 34 "Running Exchange operations (subprocess)..."
+
+        $cfg = Get-CertConfig
+        $eParams = @{
+            AppId         = if ($cfg) { $cfg['AppId'] }          else { "" }
+            Thumbprint    = if ($cfg) { $cfg['CertThumbprint'] }  else { "" }
+            Organization  = if ($cfg) { $cfg['ExchangeOrg'] }    else { "" }
+            OrigMail      = $origMail
+            DelegateUsers = $DelegateUsers
+            DistMembers   = $DistributionGroupMembers
+            GrpAlias      = "fwd-$localPart"
+        }
+
+        $exoCommands = @'
+# Convert to Shared Mailbox
+Write-Output "Converting mailbox to Shared..."
+Set-Mailbox -Identity $p.OrigMail -Type Shared
+Write-Output "Mailbox converted to Shared."
+
+# Delegate permissions
+foreach ($del in $p.DelegateUsers) {
+    Write-Output "Granting Full Access to: $del"
+    Add-MailboxPermission -Identity $p.OrigMail -User $del `
+        -AccessRights FullAccess -InheritanceType All -AutoMapping $true
+    Write-Output "Granting Send-As to: $del"
+    Add-RecipientPermission -Identity $p.OrigMail -Trustee $del `
+        -AccessRights SendAs -Confirm:$false
+}
+
+# Distribution group for forwarding
+Write-Output "Setting up forwarding distribution group..."
+$managedBy = if ($p.DelegateUsers.Count -gt 0) { $p.DelegateUsers[0] } else { $p.OrigMail }
+$existing  = Get-DistributionGroup -Identity $p.GrpAlias -ErrorAction SilentlyContinue
+if (-not $existing) {
+    New-DistributionGroup -Name $p.GrpAlias -Alias $p.GrpAlias `
+        -PrimarySmtpAddress $p.OrigMail -Type Distribution -ManagedBy $managedBy
+    Write-Output "Distribution group created: $($p.GrpAlias)"
+} else {
+    Set-DistributionGroup -Identity $p.GrpAlias -PrimarySmtpAddress $p.OrigMail
+    Write-Output "Distribution group updated: $($p.GrpAlias)"
+}
+foreach ($m in $p.DistMembers) {
+    Add-DistributionGroupMember -Identity $p.GrpAlias -Member $m -ErrorAction SilentlyContinue
+    Write-Output "Added dist member: $m"
+}
+Write-Output "Exchange operations complete."
+'@
+
+        Invoke-EXOProcess -Params $eParams -Commands $exoCommands -LogBox $LogBox -WhatIf $WhatIfMode
+        Write-Log "Exchange: Shared mailbox + permissions + distribution group done." "SUCCESS" $LogBox
+
+        # Step 9 - OneDrive SCA
+        Write-Log ">> 8/12 - OneDrive Site Collection Admin" "HEAD" $LogBox
+        Prog 57 "Granting OneDrive SCA..."
+
+        if ($DelegateUsers.Count -gt 0 -and $SharePointAdminURL) {
+            Step "PnP: connect and Set-PnPTenantSite -Owners" {
+                Connect-M365SharePoint -AdminUrl $SharePointAdminURL
+                $odPath     = $origUPN.Replace("@", "_").Replace(".", "_")
+                $tenantBase = $SharePointAdminURL -replace "-admin\.", "."
+                $odUrl      = "$tenantBase/personal/$odPath"
+                Write-Log "OneDrive URL: $odUrl" "INFO" $LogBox
+                foreach ($del in $DelegateUsers) {
+                    Set-PnPTenantSite -Url $odUrl -Owners $del -ErrorAction Stop
+                    Write-Log "SCA granted -> $del" "SUCCESS" $LogBox
+                }
+                Disconnect-PnPOnline
+            }
+        }
+        else { Write-Log "No delegates or SPO URL - skipping OneDrive." "WARN" $LogBox }
+
+        # Step 10 - Remove licenses (while user still exists in Entra)
+        # Shared mailboxes do not require a license, so remove now.
+        Write-Log ">> 9/12 - Remove M365 licenses" "HEAD" $LogBox
+        Prog 64 "Removing licenses..."
+
+        Step "Remove M365 licenses" {
+            $mgU = $null
+            try {
+                $res = Invoke-MgGraphRequest -Method GET `
+                    -Uri "https://graph.microsoft.com/v1.0/users?`$filter=userPrincipalName eq '$newUPN'&`$select=id,assignedLicenses" `
+                    -ErrorAction SilentlyContinue
+                if ($res -and $res.value -and $res.value.Count -gt 0) { $mgU = $res.value[0] }
+            } catch {}
+            if (-not $mgU) {
+                try {
+                    $res = Invoke-MgGraphRequest -Method GET `
+                        -Uri "https://graph.microsoft.com/v1.0/users?`$filter=mail eq '$origMail'&`$select=id,assignedLicenses" `
+                        -ErrorAction SilentlyContinue
+                    if ($res -and $res.value -and $res.value.Count -gt 0) { $mgU = $res.value[0] }
+                } catch {}
+            }
+            if ($mgU -and $mgU.assignedLicenses -and $mgU.assignedLicenses.Count -gt 0) {
+                $skus = @($mgU.assignedLicenses | ForEach-Object { $_.skuId })
+                $licBody = @{ addLicenses = @(); removeLicenses = $skus } | ConvertTo-Json -Depth 5
+                Invoke-MgGraphRequest -Method POST `
+                    -Uri "https://graph.microsoft.com/v1.0/users/$($mgU.id)/assignLicense" `
+                    -Body $licBody -ContentType "application/json" | Out-Null
+                Write-Log "Removed $($skus.Count) license(s)." "SUCCESS" $LogBox
+            }
+            else { Write-Log "No licenses assigned (or already removed)." "INFO" $LogBox }
+        }
+
+        # Disconnect Exchange before AD operations
+        try { Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+
+        # Step 11 - Disable and move AD account (AFTER all Exchange/M365 work)
+        Write-Log ">> 10/12 - Disable and move AD account" "HEAD" $LogBox
+        Prog 74 "Disabling account..."
+
+        Step "Disable-ADAccount" {
+            Disable-ADAccount -Identity $newSam
+            Write-Log "Account disabled." "SUCCESS" $LogBox
+        }
+        Step "Move to Disabled Users OU" {
+            Move-ADObject -Identity $u.DistinguishedName -TargetPath $DisabledUsersOU
+            Write-Log "Moved -> $DisabledUsersOU" "SUCCESS" $LogBox
+        }
+
+        # Step 12 - Sync #2: push disable/move
+        # IMPORTANT: If the Disabled Users OU is outside the Entra Connect sync scope,
+        # this will soft-delete the Entra user (30-day recovery window).
+        # Step 13 handles detecting and restoring it as a cloud-only account.
+        Write-Log ">> 11/12 - Entra sync #2 (push disable / move)" "HEAD" $LogBox
+        Prog 82 "Triggering Entra sync #2..."
+
+        if ($AADConnectServer) {
+            Step "Delta sync #2 - $AADConnectServer" {
+                $isLocal = ($AADConnectServer -eq $env:COMPUTERNAME) -or
+                           ($AADConnectServer -eq "localhost") -or
+                           ($AADConnectServer -eq "127.0.0.1")
+                if ($isLocal) {
+                    # ADSync depends on System.Web (.NET Framework only).
+                    # In PS7 (.NET 6+) we must run it in a powershell.exe (PS5.1) subprocess.
+                    if ($PSVersionTable.PSVersion.Major -ge 7) {
+                        $syncOut = powershell.exe -NoProfile -ExecutionPolicy Bypass `
+                            -Command "Import-Module ADSync -ErrorAction Stop; Start-ADSyncSyncCycle -PolicyType Delta" 2>&1
+                        if ($LASTEXITCODE -ne 0) {
+                            throw "ADSync local sync failed (exit $LASTEXITCODE): $syncOut"
+                        }
+                    } else {
+                        Import-Module ADSync -ErrorAction Stop
+                        Start-ADSyncSyncCycle -PolicyType Delta | Out-Null
+                    }
+                } else {
+                    # Remote: Invoke-Command targets the server's default PS session (PS5.1) - ADSync works fine
+                    Invoke-Command -ComputerName $AADConnectServer -ScriptBlock {
+                        Import-Module ADSync -ErrorAction Stop
+                        Start-ADSyncSyncCycle -PolicyType Delta | Out-Null
+                    }
+                }
+                Write-Log "Sync #2 triggered - waiting 90s for Entra to process..." "INFO" $LogBox
+                Start-Sleep -Seconds 90
+            }
+        }
+        else { Write-Log "No AADConnect server - skipping sync #2." "WARN" $LogBox }
+
+        # Step 13 - Restore cloud-only identity if Entra soft-deleted the user
+        # This happens when the Disabled Users OU is not in the Entra Connect sync scope.
+        # Restoring makes the account "cloud-only" so the shared mailbox persists indefinitely.
+        Write-Log ">> 12/12 - Verify Entra identity (restore if soft-deleted)" "HEAD" $LogBox
+        Prog 90 "Checking Entra user status..."
+
+        Step "Check and restore cloud identity" {
+            $entraUser = $null
+            try {
+                $chk = Invoke-MgGraphRequest -Method GET `
+                    -Uri "https://graph.microsoft.com/v1.0/users?`$filter=userPrincipalName eq '$newUPN'&`$select=id,accountEnabled" `
+                    -ErrorAction SilentlyContinue
+                if ($chk -and $chk.value -and $chk.value.Count -gt 0) { $entraUser = $chk.value[0] }
+            } catch {}
+
+            if ($entraUser) {
+                Write-Log "Entra user exists (OU is in sync scope - cloud-only restore not needed)." "INFO" $LogBox
+                Write-Log "Shared mailbox will persist as long as the synced account remains." "INFO" $LogBox
+            } else {
+                Write-Log "User not found in Entra active directory - checking Deleted Users..." "INFO" $LogBox
+                $deletedRes = $null
+                try {
+                    $deletedRes = Invoke-MgGraphRequest -Method GET `
+                        -Uri "https://graph.microsoft.com/v1.0/directory/deletedItems/microsoft.graph.user?`$filter=userPrincipalName eq '$newUPN'" `
+                        -ErrorAction SilentlyContinue
+                } catch {}
+
+                if ($deletedRes -and $deletedRes.value -and $deletedRes.value.Count -gt 0) {
+                    $deletedId = $deletedRes.value[0].id
+                    Write-Log "Found in Deleted Users - restoring as cloud-only account..." "INFO" $LogBox
+                    try {
+                        Invoke-MgGraphRequest -Method POST `
+                            -Uri "https://graph.microsoft.com/v1.0/directory/deletedItems/$deletedId/restore" `
+                            -Body "{}" -ContentType "application/json" | Out-Null
+                        Write-Log "Cloud-only identity restored successfully." "SUCCESS" $LogBox
+                        Write-Log "Shared mailbox is now permanently retained (no AD sync dependency)." "SUCCESS" $LogBox
+                    } catch {
+                        Write-Log "Auto-restore failed: $_ - restore manually in Entra portal within 30 days." "WARN" $LogBox
+                    }
+                } else {
+                    Write-Log "User not yet in Deleted Users - sync may still be processing." "WARN" $LogBox
+                    Write-Log "Check Entra portal in ~5 minutes. Restore manually if needed within 30 days." "WARN" $LogBox
+                }
+            }
+        }
+
+        try { $null = Disconnect-MgGraph -ErrorAction SilentlyContinue } catch {}
+
+        Prog 100 "Complete."
+        Write-Log "" "INFO" $LogBox
+        Write-Log "============================================" "SUCCESS" $LogBox
+        Write-Log " OFFBOARDING COMPLETE" "SUCCESS" $LogBox
+        Write-Log " Was : $origDisp ($origMail)" "SUCCESS" $LogBox
+        Write-Log " Now : $newDisp ($newUPN)" "SUCCESS" $LogBox
+        Write-Log " Mailbox  : Shared | Delegates: $($DelegateUsers -join ', ')" "SUCCESS" $LogBox
+        Write-Log " Licenses : Removed | AD: Disabled + Moved" "SUCCESS" $LogBox
+        Write-Log " Entra    : Cloud-only (see log for details)" "SUCCESS" $LogBox
+        if ($WhatIfMode) { Write-Log " *** WHATIF - no changes were made ***" "WARN" $LogBox }
+        Write-Log "============================================" "SUCCESS" $LogBox
+        return $true
+    }
+    catch {
+        Write-Log "FATAL: $_" "ERROR" $LogBox
+        Prog 0 "Error - see log."
+        return $false
+    }
+}
+
+function OB-Lbl { param($t, $x, $y, $w = 200, $h = 22, $f = $F_NORM, $c = $TEXT)
+    $l = New-Object System.Windows.Forms.Label
+    $l.Text = $t; $l.Location = [System.Drawing.Point]::new($x, $y)
+    $l.Size = [System.Drawing.Size]::new($w, $h)
+    $l.Font = $f; $l.ForeColor = $c
+    $l.BackColor = [System.Drawing.Color]::Transparent; $l
+}
+function OB-TBox { param($x, $y, $w = 260, $h = 26, $multi = $false)
+    $t = New-Object System.Windows.Forms.TextBox
+    $t.Location = [System.Drawing.Point]::new($x, $y); $t.Size = [System.Drawing.Size]::new($w, $h)
+    $t.Font = $F_NORM; $t.ForeColor = $TEXT; $t.BackColor = $CLR_INPUT; $t.BorderStyle = "FixedSingle"
+    if ($multi) { $t.Multiline = $true; $t.ScrollBars = "Vertical" }; $t
+}
+function OB-Btn { param($t, $x, $y, $w = 120, $h = 30, $bg = $ACCENT, $fg = $BG)
+    $b = New-Object System.Windows.Forms.Button
+    $b.Text = $t; $b.Location = [System.Drawing.Point]::new($x, $y); $b.Size = [System.Drawing.Size]::new($w, $h)
+    $b.Font = $F_BOLD; $b.ForeColor = $fg; $b.BackColor = $bg
+    $b.FlatStyle = "Flat"; $b.FlatAppearance.BorderSize = 0; $b.Cursor = "Hand"; $b
+}
+function OB-GBox { param($t, $x, $y, $w, $h)
+    $g = New-Object System.Windows.Forms.GroupBox
+    $g.Text = $t; $g.Location = [System.Drawing.Point]::new($x, $y); $g.Size = [System.Drawing.Size]::new($w, $h)
+    $g.Font = $F_BOLD; $g.ForeColor = $ACCENT; $g.BackColor = $PANEL; $g
+}
+
+function Show-UserSearch {
+    param([System.Windows.Forms.Form]$Parent = $null)
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = "Search Active Directory Users"
+    $dlg.Size = [System.Drawing.Size]::new(640, 500)
+    $dlg.StartPosition = "CenterParent"; $dlg.BackColor = $BG
+    $dlg.FormBorderStyle = "FixedDialog"; $dlg.MaximizeBox = $false; $dlg.MinimizeBox = $false
+
+    $dlg.Controls.Add((OB-Lbl "Search by name, SAM account, or email:" 10 12 400 22 $F_BOLD $TEXT))
+    $txtQ = OB-TBox 10 36 500 26; $dlg.Controls.Add($txtQ)
+    $btnGo = OB-Btn "Search" 520 34 96 28 $ACCENT $BG; $dlg.Controls.Add($btnGo)
+    $dlg.Controls.Add((OB-Lbl "Results - double-click or select and click OK:" 10 70 500 20 $F_NORM $TEXTDIM))
+
+    $lv = New-Object System.Windows.Forms.ListView
+    $lv.Location = [System.Drawing.Point]::new(10, 92); $lv.Size = [System.Drawing.Size]::new(606, 308)
+    $lv.View = "Details"; $lv.FullRowSelect = $true; $lv.GridLines = $true
+    $lv.Font = $F_NORM; $lv.BackColor = $CLR_INPUT; $lv.ForeColor = $TEXT; $lv.BorderStyle = "FixedSingle"
+    [void]$lv.Columns.Add("Display Name", 200); [void]$lv.Columns.Add("SAM", 120)
+    [void]$lv.Columns.Add("Email", 200); [void]$lv.Columns.Add("Status", 76)
+    $dlg.Controls.Add($lv)
+
+    $lblC  = OB-Lbl "" 10 408 400 20 $F_NORM $TEXTDIM; $dlg.Controls.Add($lblC)
+    $btnOK = OB-Btn "Select" 400 406 130 30 $GREEN $BG; $btnOK.Enabled = $false; $dlg.Controls.Add($btnOK)
+    $btnX  = OB-Btn "Cancel" 540 406 76 30 $BORDER $TEXT; $dlg.Controls.Add($btnX)
+
+    $script:SearchResult = $null
+
+    $doSearch = {
+        $q = $txtQ.Text.Trim(); $lv.Items.Clear()
+        if ($q.Length -lt 2) { $lblC.Text = "Enter at least 2 characters."; return }
+        try {
+            $hits = Get-ADUser -Filter "(Name -like '*$q*') -or (SamAccountName -like '*$q*') -or (EmailAddress -like '*$q*') -or (DisplayName -like '*$q*')" `
+                -Properties DisplayName, EmailAddress, UserPrincipalName, Enabled |
+                Sort-Object DisplayName | Select-Object -First 100
+            foreach ($h in $hits) {
+                $item = New-Object System.Windows.Forms.ListViewItem("$($h.DisplayName)")
+                [void]$item.SubItems.Add("$($h.SamAccountName)")
+                [void]$item.SubItems.Add("$($h.EmailAddress)")
+                [void]$item.SubItems.Add($(if ($h.Enabled) { "Active" } else { "Disabled" }))
+                $item.Tag = $h
+                if (-not $h.Enabled) { $item.ForeColor = $TEXTDIM }
+                [void]$lv.Items.Add($item)
+            }
+            $lblC.Text = "$($hits.Count) user(s) found."
+        }
+        catch { $lblC.Text = "Search error: $_" }
+    }
+
+    $btnGo.Add_Click($doSearch)
+    $txtQ.Add_KeyDown({ if ($_.KeyCode -eq "Return") { & $doSearch } })
+    $lv.Add_SelectedIndexChanged({ $btnOK.Enabled = ($lv.SelectedItems.Count -gt 0) })
+    $lv.Add_DoubleClick({
+            if ($lv.SelectedItems.Count -gt 0) {
+                $script:SearchResult = $lv.SelectedItems[0].Tag
+                $dlg.DialogResult = "OK"; $dlg.Close()
+            }
+        })
+    $btnOK.Add_Click({
+            if ($lv.SelectedItems.Count -gt 0) {
+                $script:SearchResult = $lv.SelectedItems[0].Tag
+                $dlg.DialogResult = "OK"; $dlg.Close()
+            }
+        })
+    $btnX.Add_Click({ $dlg.DialogResult = "Cancel"; $dlg.Close() })
+    $script:SearchResult = $null
+    if ($Parent) { [void]$dlg.ShowDialog($Parent) } else { [void]$dlg.ShowDialog() }
+    $dlg.Dispose()
+}
+
+$script:SearchResult = $null
+
+function Show-OffboardPage {
+    param($Owner)
+    try {
+$form = New-Object System.Windows.Forms.Form
+$form.Text = "AD/M365 User Offboarding Tool"
+$form.Size = [System.Drawing.Size]::new(820, 660)
+$form.StartPosition = "CenterParent"; $form.BackColor = $BG
+$form.FormBorderStyle = "Sizable"; $form.MaximizeBox = $true; $form.Font = $F_NORM
+$form.MinimumSize = [System.Drawing.Size]::new(750, 540)
+
+# Scrollable content panel - all content goes here so bottom buttons always visible
+$pnlScroll = New-Object System.Windows.Forms.Panel
+$pnlScroll.Dock = "Fill"
+$pnlScroll.AutoScroll = $true
+$pnlScroll.BackColor = $BG
+
+# Title strip
+$pnlTitle = New-Object System.Windows.Forms.Panel
+$pnlTitle.Location = [System.Drawing.Point]::new(0, 0); $pnlTitle.Size = [System.Drawing.Size]::new(820, 52)
+$pnlTitle.BackColor = [System.Drawing.Color]::FromArgb(12, 16, 24)
+$pnlTitle.Controls.Add((OB-Lbl "  [OFFBOARD]  AD/M365 User Offboarding Tool" 0 8 560 34 $F_TITLE $ACCENT))
+$pnlTitle.Controls.Add((OB-Lbl "Domain: $($script:E.LocalDomain)   Tenant: $($script:E.TenantName)" 556 18 254 20 $F_NORM $TEXTDIM))
+$pnlScroll.Controls.Add($pnlTitle)
+
+# Status banner
+$pnlBanner = New-Object System.Windows.Forms.Panel
+$pnlBanner.Location = [System.Drawing.Point]::new(0, 52); $pnlBanner.Size = [System.Drawing.Size]::new(820, 24)
+$pnlBanner.BackColor = [System.Drawing.Color]::FromArgb(0, 55, 18)
+$lblBanner = OB-Lbl "  [OK] Modules verified   [OK] M365 roles verified" 0 3 820 18 $F_NORM $GREEN
+$pnlBanner.Controls.Add($lblBanner)
+$pnlScroll.Controls.Add($pnlBanner)
+
+# User section
+$grpUser = OB-GBox "User to Offboard" 10 84 794 112
+$pnlScroll.Controls.Add($grpUser)
+
+$grpUser.Controls.Add((OB-Lbl "SAM Account:" 10 26 110 22 $F_BOLD $TEXT))
+$txtSAM = OB-TBox 126 22 216 26; $grpUser.Controls.Add($txtSAM)
+$btnSearchAD = OB-Btn "Search AD" 352 20 116 28 $PANEL $ACCENT; $grpUser.Controls.Add($btnSearchAD)
+$btnLookup   = OB-Btn "Lookup"    477 20 90  28 $PANEL $GREEN;  $grpUser.Controls.Add($btnLookup)
+
+$lblUserInfo = OB-Lbl "Enter a SAM account name above, or click Search AD to find a user." 10 56 760 22 $F_NORM $TEXTDIM
+$grpUser.Controls.Add($lblUserInfo)
+$lblPreview = OB-Lbl "" 10 78 760 22 $F_NORM $ACCENT
+$grpUser.Controls.Add($lblPreview)
+
+# AD and Sync section
+$grpAD = OB-GBox "AD and Sync  (auto-discovered - edit if needed)" 10 204 794 102
+$pnlScroll.Controls.Add($grpAD)
+
+$grpAD.Controls.Add((OB-Lbl "Disabled Users OU:" 10 26 140 22 $F_BOLD $TEXT))
+$txtOU = OB-TBox 155 22 615 26; $txtOU.Text = $script:E.DisabledUsersOU; $grpAD.Controls.Add($txtOU)
+
+$grpAD.Controls.Add((OB-Lbl "AADConnect Server:" 10 58 140 22 $F_BOLD $TEXT))
+$txtAADC = OB-TBox 155 54 200 26; $txtAADC.Text = $script:E.AADConnectServer; $grpAD.Controls.Add($txtAADC)
+
+$chkWhatIf = New-Object System.Windows.Forms.CheckBox
+$chkWhatIf.Text = "WhatIf - simulation only (no changes)"
+$chkWhatIf.Location = [System.Drawing.Point]::new(368, 56); $chkWhatIf.Size = [System.Drawing.Size]::new(312, 24)
+$chkWhatIf.Font = $F_BOLD; $chkWhatIf.ForeColor = $WARN
+$chkWhatIf.BackColor = [System.Drawing.Color]::Transparent
+$grpAD.Controls.Add($chkWhatIf)
+
+# M365 section
+$grpM365 = OB-GBox "M365  (auto-discovered - edit if needed)" 10 314 794 60
+$pnlScroll.Controls.Add($grpM365)
+$grpM365.Controls.Add((OB-Lbl "SPO Admin URL:" 10 26 120 22 $F_BOLD $TEXT))
+$txtSPO = OB-TBox 136 22 640 26; $txtSPO.Text = $script:E.SharePointAdminURL; $grpM365.Controls.Add($txtSPO)
+
+# Delegation section
+$grpDel = OB-GBox "Delegates - Full Access, Send-As, OneDrive SCA  (one UPN per line)" 10 382 385 124
+$pnlScroll.Controls.Add($grpDel)
+$txtDelegates = OB-TBox 10 20 360 92 $true; $grpDel.Controls.Add($txtDelegates)
+
+$grpDist = OB-GBox "Forwarding Dist Group Members  (one UPN per line)" 405 382 399 124
+$pnlScroll.Controls.Add($grpDist)
+$grpDist.Controls.Add((OB-Lbl "Group fwd-<sam> will receive old email as primary SMTP" 10 4 370 16 $F_NORM $TEXTDIM))
+$txtDist = OB-TBox 10 20 374 92 $true; $grpDist.Controls.Add($txtDist)
+
+# Progress and log
+$progress = New-Object System.Windows.Forms.ProgressBar
+$progress.Location = [System.Drawing.Point]::new(10, 516); $progress.Size = [System.Drawing.Size]::new(794, 16)
+$progress.Minimum = 0; $progress.Maximum = 100; $progress.ForeColor = $GREEN; $progress.BackColor = $PANEL
+$pnlScroll.Controls.Add($progress)
+
+$lblStatus = OB-Lbl "Ready - complete the fields above and click Run Offboarding." 10 536 794 20 $F_NORM $TEXTDIM
+$pnlScroll.Controls.Add($lblStatus)
+
+$logBox = New-Object System.Windows.Forms.RichTextBox
+$logBox.Location = [System.Drawing.Point]::new(10, 560); $logBox.Size = [System.Drawing.Size]::new(794, 100)
+$logBox.Font = $F_MONO; $logBox.BackColor = [System.Drawing.Color]::FromArgb(10, 14, 22)
+$logBox.ForeColor = $TEXT; $logBox.ReadOnly = $true; $logBox.BorderStyle = "None"; $logBox.ScrollBars = "Vertical"
+$pnlScroll.Controls.Add($logBox)
+
+if ($script:StartupLog -and $script:StartupLog.Count -gt 0) {
+    Write-Log "--- Startup log (module bootstrap / Graph version-skew repair / role check) ---" "INFO" $logBox
+    foreach ($entry in $script:StartupLog) {
+        $mappedLevel = switch ($entry.Level) { "OK" { "SUCCESS" } "ERR" { "ERROR" } "WARN" { "WARN" } default { "INFO" } }
+        Write-Log $entry.Message $mappedLevel $logBox
+    }
+    Write-Log "--- End startup log ---" "INFO" $logBox
+}
+
+# Bottom bar
+$pnlBot = New-Object System.Windows.Forms.Panel
+$pnlBot.Dock = "Bottom"; $pnlBot.Height = 52
+$pnlBot.BackColor = [System.Drawing.Color]::FromArgb(12, 16, 24)
+$form.Controls.Add($pnlBot)
+$form.Controls.Add($pnlScroll)
+
+$btnRun     = OB-Btn "Run Offboarding"   10  10 185 34 $GREEN  $BG
+$btnRun.Font = New-Object System.Drawing.Font("Segoe UI Semibold", 10)
+$btnExport   = OB-Btn "Export Log"       206  12 130 30 $BORDER $TEXT
+$btnRecheck  = OB-Btn "Re-check Setup"   346  12 160 30 $PANEL  $ACCENT
+$btnSetupAuth= OB-Btn "Setup Auth"       516  12 140 30 $PANEL  $WARN
+$btnClose    = OB-Btn "Close"            700  12 100 30 $DANGER ([System.Drawing.Color]::White)
+$pnlBot.Controls.AddRange(@($btnRun, $btnExport, $btnRecheck, $btnSetupAuth, $btnClose))
+
+# ============================================================
+# EVENTS
+# ============================================================
+
+$btnSearchAD.Add_Click({
+        Show-UserSearch -Parent $form
+        if ($script:SearchResult) {
+            $u = $script:SearchResult; $txtSAM.Text = $u.SamAccountName
+            $lblUserInfo.ForeColor = $GREEN
+            $lblUserInfo.Text = "[OK]  $($u.DisplayName)  |  $($u.EmailAddress)  |  $(if ($u.Enabled) { 'Active' } else { 'Disabled' })"
+            $lp = $u.UserPrincipalName.Split("@")[0]; $suf = $u.UserPrincipalName.Split("@")[1]
+            $lblPreview.Text = "Will rename -> ""Historical - $($u.DisplayName)""   UPN -> ""Historical-$lp@$suf"""
+        }
+    })
+
+$btnLookup.Add_Click({
+        $sam = $txtSAM.Text.Trim()
+        if ($sam -eq "") { $lblUserInfo.ForeColor = $WARN; $lblUserInfo.Text = "Enter a SAM first."; return }
+        try {
+            $u = Get-ADUser -Identity $sam -Properties DisplayName, EmailAddress, UserPrincipalName, Enabled
+            $lblUserInfo.ForeColor = $GREEN
+            $lblUserInfo.Text = "[OK]  $($u.DisplayName)  |  $($u.EmailAddress)  |  $(if ($u.Enabled) { 'Active' } else { 'Disabled' })"
+            $lp = $u.UserPrincipalName.Split("@")[0]; $suf = $u.UserPrincipalName.Split("@")[1]
+            $lblPreview.Text = "Will rename -> ""Historical - $($u.DisplayName)""   UPN -> ""Historical-$lp@$suf"""
+        }
+        catch {
+            $lblUserInfo.ForeColor = $DANGER; $lblUserInfo.Text = "[X]  Not found: $sam"; $lblPreview.Text = ""
+        }
+    })
+
+$btnRun.Add_Click({
+        $sam = $txtSAM.Text.Trim(); $ou = $txtOU.Text.Trim()
+        if ($sam -eq "" -or $ou -eq "") {
+            [System.Windows.Forms.MessageBox]::Show(
+                "SAM Account Name and Disabled Users OU are required.",
+                "Missing Fields", "OK", "Warning"); return
+        }
+
+        $dels  = @($txtDelegates.Text -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" })
+        $dists = @($txtDist.Text      -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" })
+        $aadc  = $txtAADC.Text.Trim(); $spo = $txtSPO.Text.Trim(); $wi = $chkWhatIf.Checked
+
+        $msg = "Offboard user: $sam`n`n" +
+            "  Disabled OU : $ou`n" +
+            "  AADConnect  : $(if ($aadc) { $aadc } else { '(skip)' })`n" +
+            "  Delegates   : $(if ($dels.Count) { $dels -join ', ' } else { '(none)' })`n" +
+            "  SPO URL     : $(if ($spo) { $spo } else { '(skip)' })`n" +
+            "  WhatIf      : $wi`n`n" +
+            "$(if ($wi) { 'SIMULATION - no changes will be made.' } else { 'THIS WILL MAKE LIVE CHANGES. Proceed?' })"
+
+        if ([System.Windows.Forms.MessageBox]::Show($msg, "Confirm Offboarding", "YesNo", "Question") -ne "Yes") { return }
+
+        $btnRun.Enabled = $false; $logBox.Clear()
+
+        $ok = Invoke-Offboarding `
+            -SamAccountName           $sam `
+            -DisabledUsersOU          $ou `
+            -DelegateUsers            $dels `
+            -DistributionGroupMembers $dists `
+            -AADConnectServer         $aadc `
+            -SharePointAdminURL       $spo `
+            -WhatIfMode               $wi `
+            -LogBox                   $logBox `
+            -ProgressBar              $progress `
+            -StatusLabel              $lblStatus
+
+        $btnRun.Enabled = $true
+        if ($ok) {
+            $lblStatus.ForeColor = $GREEN; $lblStatus.Text = "[OK]  Offboarding complete."
+            if (-not $wi) {
+                [System.Windows.Forms.MessageBox]::Show(
+                    "Offboarding completed for: $sam", "Done", "OK", "Information")
+            }
+        }
+        else { $lblStatus.ForeColor = $DANGER; $lblStatus.Text = "[X]  Error - see log." }
+    })
+
+$btnRecheck.Add_Click({
+        $lblBanner.ForeColor = $WARN
+        $lblBanner.Text = "  [...]  Re-checking modules and M365 roles..."
+        $pnlBanner.BackColor = [System.Drawing.Color]::FromArgb(60, 40, 0)
+        [System.Windows.Forms.Application]::DoEvents()
+        try {
+            Invoke-ModuleBootstrap -Silent:$false
+            Invoke-RoleBootstrap -AdminUPN $AdminUPN -Silent:$false
+            $lblBanner.ForeColor = $GREEN
+            $lblBanner.Text = "  [OK] Modules verified   [OK] M365 roles verified"
+            $pnlBanner.BackColor = [System.Drawing.Color]::FromArgb(0, 55, 18)
+        }
+        catch {
+            $lblBanner.ForeColor = $DANGER; $lblBanner.Text = "  [X]  Setup issue - see console."
+            $pnlBanner.BackColor = [System.Drawing.Color]::FromArgb(60, 0, 0)
+        }
+    })
+
+$btnExport.Add_Click({
+        $dlg = New-Object System.Windows.Forms.SaveFileDialog
+        $dlg.Title = "Export Log"; $dlg.Filter = "Text (*.txt)|*.txt|All|*.*"
+        $dlg.FileName = "Offboard-$(Get-Date -Format 'yyyyMMdd-HHmmss').txt"
+        if ($dlg.ShowDialog() -eq "OK") {
+            $logBox.Text | Set-Content $dlg.FileName -Encoding UTF8
+            Write-Log "Log exported: $($dlg.FileName)" "SUCCESS" $logBox
+        }
+    })
+
+$btnSetupAuth.Add_Click({
+        $cfg = Get-CertConfig
+        if ($cfg) {
+            $ans = [System.Windows.Forms.MessageBox]::Show(
+                "Non-interactive auth is already configured.`n`n" +
+                "App ID  : $($cfg.AppId)`n" +
+                "Cert    : $($cfg.CertThumbprint)`n`n" +
+                "Run setup again to replace it?",
+                "Auth Already Configured", "YesNo", "Question")
+            if ($ans -ne "Yes") { return }
+        }
+        $btnSetupAuth.Enabled = $false
+        $logBox.Clear()
+        $ok = Initialize-M365Auth -LogBox $logBox
+        $btnSetupAuth.Enabled = $true
+        if ($ok) {
+            $lblStatus.ForeColor = $GREEN
+            $lblStatus.Text = "[OK] Non-interactive auth configured. Wait 5-10 min then re-check setup."
+        } else {
+            $lblStatus.ForeColor = $DANGER
+            $lblStatus.Text = "[X] Setup Auth failed - see log."
+        }
+    })
+
+$btnClose.Add_Click({ $form.Close() })
+
+    [void]$form.ShowDialog($Owner)
+    } catch {
+        [System.Windows.Forms.MessageBox]::Show(
+            "A startup error occurred:`n`n$_`n`nLine: $($_.InvocationInfo.ScriptLineNumber)",
+            "Startup Error", "OK", "Error") | Out-Null
+    }
+}
 # ---------------------------------------------------------------
 # HARD-MATCH PAGE - color/font palette + local Write-Log
 # Kept deliberately separate from the toolbox's own shared palette/Write-Log
