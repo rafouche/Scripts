@@ -1226,7 +1226,1317 @@ $F_TITLE = New-Object System.Drawing.Font("Segoe UI Semibold", 14)
 # ---- Stub pages (replaced one at a time as each tool is ported in) ----
 function Show-OnboardPage    { param($Owner) Write-Log "Onboard page not yet implemented in the combined toolbox - use Onboard-ADUser.ps1 directly for now." "WARN" $script:launcherLog }
 function Show-OffboardPage   { param($Owner) Write-Log "Offboard page not yet implemented in the combined toolbox - use Offboard-ADUser.ps1 directly for now." "WARN" $script:launcherLog }
-function Show-HardMatchPage  { param($Owner) Write-Log "Hard-Match page not yet implemented in the combined toolbox - use Set-ADEntraHardMatch.ps1 directly for now." "WARN" $script:launcherLog }
+# ---------------------------------------------------------------
+# HARD-MATCH PAGE - color/font palette + local Write-Log
+# Kept deliberately separate from the toolbox's own shared palette/Write-Log
+# (bare $C/$F/Write-Log/$script:LogBox in the original standalone file,
+# renamed here to $script:HMColors/$script:HMFonts/Write-HMLog/
+# $script:HMLogBox) rather than ported to match. $C has a documented,
+# already-hit bug in this exact tool family: PowerShell variable names are
+# case-insensitive, so a stray local $c/$C anywhere downstream silently
+# shadows the palette hashtable and breaks every Write-Log call after it.
+# Renaming rather than reusing the toolbox's shared names removes any
+# chance of that same class of bug resurfacing as more pages get added.
+# ---------------------------------------------------------------
+$script:HMColors = @{
+    BG       = [System.Drawing.Color]::FromArgb( 24,  24,  24)
+    Panel    = [System.Drawing.Color]::FromArgb( 32,  32,  32)
+    Card     = [System.Drawing.Color]::FromArgb( 40,  40,  40)
+    Border   = [System.Drawing.Color]::FromArgb( 60,  60,  60)
+    Accent   = [System.Drawing.Color]::FromArgb(  0, 120, 212)
+    Success  = [System.Drawing.Color]::FromArgb( 40, 167,  69)
+    Warning  = [System.Drawing.Color]::FromArgb(255, 193,   7)
+    Danger   = [System.Drawing.Color]::FromArgb(220,  53,  69)
+    FG       = [System.Drawing.Color]::FromArgb(220, 220, 220)
+    FGDim    = [System.Drawing.Color]::FromArgb(140, 140, 140)
+    FGHdr    = [System.Drawing.Color]::FromArgb(255, 255, 255)
+    LogBG    = [System.Drawing.Color]::FromArgb( 18,  18,  18)
+}
+$script:HMFonts = @{
+    UI    = [System.Drawing.Font]::new('Segoe UI',  9)
+    UIB   = [System.Drawing.Font]::new('Segoe UI',  9, [System.Drawing.FontStyle]::Bold)
+    Small = [System.Drawing.Font]::new('Segoe UI',  8)
+    Mono  = [System.Drawing.Font]::new('Consolas',  8)
+    Title = [System.Drawing.Font]::new('Segoe UI', 11, [System.Drawing.FontStyle]::Bold)
+    Hdr   = [System.Drawing.Font]::new('Segoe UI',  9, [System.Drawing.FontStyle]::Bold)
+}
+$script:HMLogBox    = $null
+$script:LblStatus   = $null
+$script:SelAD       = $null   # single-mode selected AD user
+$script:SelEntra    = $null   # single-mode selected Entra user
+
+function Write-HMLog {
+    param([string]$Msg, [string]$Level = 'INFO')
+    $ts  = Get-Date -Format 'HH:mm:ss'
+    $col = switch ($Level) {
+        'OK'   { $script:HMColors.Success }
+        'WARN' { $script:HMColors.Warning }
+        'ERR'  { $script:HMColors.Danger  }
+        default{ $script:HMColors.FGDim   }
+    }
+    if ($script:HMLogBox) {
+        $script:HMLogBox.SelectionStart  = $script:HMLogBox.TextLength
+        $script:HMLogBox.SelectionLength = 0
+        $script:HMLogBox.SelectionColor  = $col
+        $script:HMLogBox.AppendText("[$ts][$Level] $Msg`r`n")
+        $script:HMLogBox.ScrollToCaret()
+    } elseif ($script:StartupLog) {
+        # Everything that runs before the GUI (and its log box) exists - module bootstrap,
+        # Graph version-skew repair, the Setup Auth offer, the initial Connect-ToGraph -
+        # otherwise only ever reached whatever console launched the script, easy to miss and
+        # useless for after-the-fact diagnosis. Buffer it here; the GUI section replays it
+        # into the log box the moment that control is created.
+        $script:StartupLog.Add([PSCustomObject]@{ Level = $Level; Message = $Msg })
+    }
+    $hostCol = switch ($Level) {
+        'OK'   { 'Green'  }
+        'WARN' { 'Yellow' }
+        'ERR'  { 'Red'    }
+        default{ 'Cyan'   }
+    }
+    Write-Host "[$ts][$Level] $Msg" -ForegroundColor $hostCol
+}
+
+function Set-Status {
+    param([string]$Msg)
+    if ($script:LblStatus) {
+        $script:LblStatus.Text = $Msg
+        $script:LblStatus.Refresh()
+    }
+}
+
+# Safely pull a display string out of a caught error. Some Graph SDK exception
+# types throw their own error (e.g. "The property 'Warning' cannot be found
+# on this object") when PowerShell tries to stringify them (`"$_"`/.ToString())
+# -- known Microsoft.Graph SDK behavior, sometimes triggered by a stale/mixed
+# module session (e.g. Az.Accounts also loaded). Reading .Exception.Message
+# directly avoids invoking that broken stringification path; if even that
+# fails, fall back to a generic message instead of crashing the caller.
+function Get-SafeErrorText {
+    param($ErrorRecord)
+    try {
+        if ($ErrorRecord.Exception -and $ErrorRecord.Exception.Message) {
+            return $ErrorRecord.Exception.Message
+        }
+    } catch {}
+    return 'Unknown error (failed to read exception details -- check for a stale/mixed PowerShell module session, e.g. Az.Accounts loaded alongside Microsoft.Graph).'
+}
+
+function New-Btn {
+    param([string]$Text,[int]$W=120,[int]$H=30,[System.Drawing.Color]$BG)
+    $b = [System.Windows.Forms.Button]::new()
+    $b.Text      = $Text
+    $b.Width     = $W
+    $b.Height    = $H
+    $b.FlatStyle = 'Flat'
+    $b.FlatAppearance.BorderSize  = 1
+    $b.FlatAppearance.BorderColor = $script:HMColors.Border
+    $b.BackColor = if ($PSBoundParameters.ContainsKey('BG')) { $BG } else { $script:HMColors.Card }
+    $b.ForeColor = $script:HMColors.FGHdr
+    $b.Font      = $script:HMFonts.UIB
+    $b.Cursor    = [System.Windows.Forms.Cursors]::Hand
+    return $b
+}
+
+function New-Txt {
+    param([int]$W=260)
+    $t = [System.Windows.Forms.TextBox]::new()
+    $t.Width       = $W
+    $t.Height      = 24
+    $t.BackColor   = $script:HMColors.Card
+    $t.ForeColor   = $script:HMColors.FG
+    $t.BorderStyle = 'FixedSingle'
+    $t.Font        = $script:HMFonts.UI
+    return $t
+}
+
+function New-Lbl {
+    param([string]$Text,[System.Drawing.Font]$Font,[System.Drawing.Color]$Color)
+    $l = [System.Windows.Forms.Label]::new()
+    $l.Text      = $Text
+    $l.Font      = if ($PSBoundParameters.ContainsKey('Font'))  { $Font  } else { $script:HMFonts.UI }
+    $l.ForeColor = if ($PSBoundParameters.ContainsKey('Color')) { $Color } else { $script:HMColors.FG }
+    $l.AutoSize  = $true
+    $l.BackColor = [System.Drawing.Color]::Transparent
+    return $l
+}
+
+function New-Sep {
+    param([int]$Y,[int]$W=760)
+    $p = [System.Windows.Forms.Panel]::new()
+    $p.Height    = 1
+    $p.Width     = $W
+    $p.BackColor = $script:HMColors.Border
+    $p.Location  = [System.Drawing.Point]::new(0,$Y)
+    return $p
+}
+
+# ---------------------------------------------------------------
+# 0F  MODULE BOOTSTRAP
+# ---------------------------------------------------------------
+
+function Get-ImmutableId([System.Guid]$g) {
+    return [Convert]::ToBase64String($g.ToByteArray())
+}
+
+# Resolve a single AD user to its best Entra candidate.
+# Returns a hashtable: @{ EntraUser=...; Confidence='Exact'|'Name'|'None'; Note=... }
+function Resolve-EntraCandidate {
+    param($ADUser)
+    # Priority 1: UPN match
+    try {
+        $u = Get-MgUser -UserId $ADUser.UserPrincipalName `
+             -Property Id,DisplayName,UserPrincipalName,AccountEnabled,OnPremisesImmutableId `
+             -EA Stop
+        return @{ EntraUser=$u; Confidence='Exact'; Note='UPN match' }
+    } catch {}
+    # Priority 2: mail match
+    if ($ADUser.EmailAddress) {
+        try {
+            $res = @(Get-MgUser -Filter "mail eq '$($ADUser.EmailAddress)'" `
+                   -Property Id,DisplayName,UserPrincipalName,AccountEnabled,OnPremisesImmutableId `
+                   -Top 1 -EA Stop)
+            if ($res.Count -gt 0) { return @{ EntraUser=$res[0]; Confidence='Exact'; Note='Mail match' } }
+        } catch {}
+    }
+    # Priority 3: displayName startsWith
+    try {
+        $dn = $ADUser.DisplayName -replace "'","''"
+        $res = @(Get-MgUser -Filter "startsWith(displayName,'$dn')" `
+               -Property Id,DisplayName,UserPrincipalName,AccountEnabled,OnPremisesImmutableId `
+               -Top 1 -EA Stop)
+        if ($res.Count -gt 0) { return @{ EntraUser=$res[0]; Confidence='Name'; Note='DisplayName match' } }
+    } catch {}
+    return @{ EntraUser=$null; Confidence='None'; Note='No match found' }
+}
+
+# ---------------------------------------------------------------
+# Find which Entra object currently owns a given ImmutableID.
+# Graph does not support direct filter on onPremisesImmutableId,
+# so we use the /users endpoint with a beta-compatible OData cast,
+# falling back to a directory-objects search via Graph REST.
+# Returns the conflicting user object, or $null if not found.
+# ---------------------------------------------------------------
+function Find-ImmutableIdOwner {
+    param([string]$ImmutableId)
+    try {
+        # Encode the value for safe URL use
+        $enc = [Uri]::EscapeDataString($ImmutableId)
+        # Graph v1.0: filter users by onPremisesImmutableId
+        $resp = Invoke-MgGraphRequest -Method GET `
+            -Uri "https://graph.microsoft.com/v1.0/users?`$filter=onPremisesImmutableId eq '$enc'&`$select=id,displayName,userPrincipalName,accountEnabled,onPremisesImmutableId" `
+            -EA Stop
+        $vals = @($resp.value)   # force array -- Graph may return bare object
+        if ($vals.Count -gt 0) {
+            return $vals[0]
+        }
+    } catch {
+        Write-HMLog "  Conflict search error: $_" 'WARN'
+    }
+    return $null
+}
+
+# ---------------------------------------------------------------
+# Show a dialog explaining the conflict and offering to clear it.
+# Returns: 'Cleared' | 'Skip' | 'Cancel'
+# ---------------------------------------------------------------
+function Show-ConflictDialog {
+    param($ConflictUser, [string]$TargetImmutableId, [string]$ADUserName)
+
+    $dlg = [System.Windows.Forms.Form]::new()
+    $dlg.Text            = 'ImmutableID Conflict Detected'
+    $dlg.Width           = 620
+    $dlg.Height          = 380
+    $dlg.StartPosition   = 'CenterParent'
+    $dlg.BackColor       = $script:HMColors.BG
+    $dlg.ForeColor       = $script:HMColors.FG
+    $dlg.Font            = $script:HMFonts.UI
+    $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.MaximizeBox     = $false
+
+    # Header
+    $pHdr = [System.Windows.Forms.Panel]::new()
+    $pHdr.Dock = 'Top'; $pHdr.Height = 48; $pHdr.BackColor = $script:HMColors.Danger
+    $dlg.Controls.Add($pHdr)
+    $lHdr = New-Lbl '  ImmutableID Collision -- Another Entra Object Owns This GUID' -Font $script:HMFonts.Hdr -Color $script:HMColors.FGHdr
+    $lHdr.Location = [System.Drawing.Point]::new(8,15); $pHdr.Controls.Add($lHdr)
+
+    # Explanation
+    $lExp = New-Lbl '' -Color $script:HMColors.FG
+    $lExp.Font = $script:HMFonts.UI
+    $lExp.AutoSize = $false
+    $lExp.Size = [System.Drawing.Size]::new(580, 110)
+    $lExp.Location = [System.Drawing.Point]::new(16, 60)
+    $lExp.Text = "The ImmutableID you are trying to assign:`r`n$TargetImmutableId`r`n`r`nis already owned by a different Entra account:`r`n`r`nThis usually means a stale duplicate, a ghost account from a previous sync, or a soft-deleted user. You must clear the ImmutableID from the conflicting account before the match can proceed."
+    $dlg.Controls.Add($lExp)
+
+    # Conflict details card
+    $pCard = [System.Windows.Forms.Panel]::new()
+    $pCard.Location = [System.Drawing.Point]::new(16, 172)
+    $pCard.Size     = [System.Drawing.Size]::new(580, 88)
+    $pCard.BackColor = $script:HMColors.Card
+    $dlg.Controls.Add($pCard)
+
+    $lCardHdr = New-Lbl 'Conflicting Entra Account:' -Font $script:HMFonts.Hdr -Color $script:HMColors.Warning
+    $lCardHdr.Location = [System.Drawing.Point]::new(8,6); $pCard.Controls.Add($lCardHdr)
+
+    if ($ConflictUser) {
+        $lName = New-Lbl "Display Name : $($ConflictUser.displayName)" -Color $script:HMColors.FG
+        $lName.Location = [System.Drawing.Point]::new(8,26); $pCard.Controls.Add($lName)
+        $lUPN  = New-Lbl "UPN          : $($ConflictUser.userPrincipalName)" -Color $script:HMColors.FGDim
+        $lUPN.Location  = [System.Drawing.Point]::new(8,44); $pCard.Controls.Add($lUPN)
+        $lID   = New-Lbl "Object ID    : $($ConflictUser.id)" -Font $script:HMFonts.Mono -Color $script:HMColors.FGDim
+        $lID.Location   = [System.Drawing.Point]::new(8,62); $pCard.Controls.Add($lID)
+    } else {
+        $lNF = New-Lbl 'Conflicting account could not be looked up (may be a contact or deleted object).' -Color $script:HMColors.Warning
+        $lNF.Location = [System.Drawing.Point]::new(8,28); $pCard.Controls.Add($lNF)
+    }
+
+    # Buttons
+    $pBot = [System.Windows.Forms.Panel]::new()
+    $pBot.Dock = 'Bottom'; $pBot.Height = 46; $pBot.BackColor = $script:HMColors.Panel
+    $dlg.Controls.Add($pBot)
+
+    $script:_conflictResult = 'Cancel'
+
+    $btnClear = New-Btn 'Clear Conflict & Retry' 190 34 $script:HMColors.Success
+    $btnClear.Location = [System.Drawing.Point]::new(220, 6)
+    $btnClear.Enabled  = ($ConflictUser -ne $null)
+    $pBot.Controls.Add($btnClear)
+
+    $btnSkip = New-Btn 'Skip This User' 130 34 $script:HMColors.Warning
+    $btnSkip.Location = [System.Drawing.Point]::new(418, 6)
+    $pBot.Controls.Add($btnSkip)
+
+    $btnCancel = New-Btn 'Cancel Batch' 110 34 $script:HMColors.Danger
+    $btnCancel.Location = [System.Drawing.Point]::new(8, 6)
+    $pBot.Controls.Add($btnCancel)
+
+    $btnClear.Add_Click({
+        if ($ConflictUser) {
+            try {
+                Write-HMLog "  Clearing ImmutableID from conflicting account: $($ConflictUser.userPrincipalName)" 'WARN'
+                $body = '{"onPremisesImmutableId": null}'
+                Invoke-MgGraphRequest -Method PATCH `
+                    -Uri "https://graph.microsoft.com/v1.0/users/$($ConflictUser.id)" `
+                    -Body $body -ContentType 'application/json' -EA Stop
+                Write-HMLog "  Conflict cleared from $($ConflictUser.userPrincipalName)." 'OK'
+                $script:_conflictResult = 'Cleared'
+            } catch {
+                Write-HMLog "  Failed to clear conflict: $_" 'ERR'
+                [System.Windows.Forms.MessageBox]::Show(
+                    "Could not clear the conflicting ImmutableID:`r`n$_",
+                    'Clear Failed','OK','Error')
+                $script:_conflictResult = 'Skip'
+            }
+        }
+        $dlg.DialogResult = 'OK'; $dlg.Close()
+    })
+    $btnSkip.Add_Click({   $script:_conflictResult = 'Skip';   $dlg.DialogResult = 'OK';     $dlg.Close() })
+    $btnCancel.Add_Click({ $script:_conflictResult = 'Cancel'; $dlg.DialogResult = 'Cancel'; $dlg.Close() })
+
+    [void]$dlg.ShowDialog()
+    return $script:_conflictResult
+}
+
+function Invoke-HardMatch {
+    param($ADUser, $EntraUser, [bool]$WhatIfMode, [bool]$AllowConflictUI = $true)
+    $targetId  = Get-ImmutableId -g $ADUser.ObjectGUID
+    $currentId = $EntraUser.OnPremisesImmutableId
+
+    Write-HMLog "  AD    : $($ADUser.DisplayName)  [$($ADUser.SamAccountName)]" 'INFO'
+    Write-HMLog "  Entra : $($EntraUser.DisplayName)  [$($EntraUser.UserPrincipalName)]" 'INFO'
+    Write-HMLog "  ImmutableID -> $targetId" 'INFO'
+
+    if ($currentId -and $currentId -eq $targetId) {
+        Write-HMLog '  Already matched -- skipped.' 'OK'
+        return 'AlreadyMatched'
+    }
+    if ($currentId -and $currentId -ne $targetId) {
+        Write-HMLog "  WARNING: overwriting existing ImmutableID on target ($currentId)" 'WARN'
+    }
+
+    if ($WhatIfMode) {
+        Write-HMLog "  [WHATIF] Would set ImmutableID on $($EntraUser.UserPrincipalName)" 'WARN'
+        return 'WhatIf'
+    }
+
+    # Inner apply -- returns 'OK','VerifyFail','Conflict','Error'
+    # Graph has eventual consistency: after Update-MgUser succeeds the read-back
+    # can still return the old value for a few seconds.  Poll up to 8x / 3s apart
+    # (~24s total) before declaring VerifyFail.
+    $doApply = {
+        try {
+            Update-MgUser -UserId $EntraUser.Id `
+                -OnPremisesImmutableId $targetId -EA Stop
+        } catch {
+            $msg = Get-SafeErrorText $_
+            if ($msg -match 'onPremisesImmutableId' -and $msg -match '400') {
+                return 'Conflict'
+            }
+            Write-HMLog "  FAILED: $msg" 'ERR'
+            return 'Error'
+        }
+        # Poll verify -- Graph eventual consistency can lag a few seconds
+        $maxRetries = 8; $retryDelay = 3; $attempt = 0
+        do {
+            if ($attempt -gt 0) {
+                Write-HMLog "  Verify attempt $attempt/$maxRetries -- waiting ${retryDelay}s for Graph consistency..." 'INFO'
+                Start-Sleep -Seconds $retryDelay
+            }
+            $attempt++
+            try {
+                $v = Get-MgUser -UserId $EntraUser.Id -Property OnPremisesImmutableId -EA Stop
+                if ($v.OnPremisesImmutableId -eq $targetId) {
+                    Write-HMLog "  Hard match applied and verified (attempt $attempt)." 'OK'
+                    return 'OK'
+                }
+            } catch {
+                Write-HMLog "  Verify read error (attempt $attempt): $_" 'WARN'
+            }
+        } while ($attempt -lt $maxRetries)
+        Write-HMLog "  Write appeared to succeed but ImmutableID not confirmed after $maxRetries attempts -- check manually." 'WARN'
+        return 'VerifyFail'
+    }
+
+    $result = & $doApply
+
+    # Handle conflict with UI resolver
+    if ($result -eq 'Conflict') {
+        Write-HMLog '  Conflict detected: another Entra object owns this ImmutableID.' 'WARN'
+        Write-HMLog '  Searching for the conflicting account...' 'INFO'
+        $conflictOwner = Find-ImmutableIdOwner -ImmutableId $targetId
+
+        if ($conflictOwner) {
+            Write-HMLog "  Conflict owner: $($conflictOwner.displayName) [$($conflictOwner.userPrincipalName)]" 'WARN'
+        } else {
+            Write-HMLog '  Could not identify conflict owner (may be deleted/contact object).' 'WARN'
+        }
+
+        if (-not $AllowConflictUI) {
+            # Non-interactive path (called from batch without UI override)
+            Write-HMLog '  Conflict resolution requires manual action -- skipping.' 'WARN'
+            return 'Conflict'
+        }
+
+        $resolution = Show-ConflictDialog -ConflictUser $conflictOwner `
+            -TargetImmutableId $targetId -ADUserName $ADUser.DisplayName
+
+        switch ($resolution) {
+            'Cleared' {
+                Write-HMLog '  Retrying hard match after conflict cleared...' 'INFO'
+                $result = & $doApply
+                if ($result -eq 'OK') { return 'OK' }
+                Write-HMLog "  Retry result: $result" $(if ($result -eq 'OK') {'OK'} else {'ERR'})
+                return $result
+            }
+            'Skip'   { Write-HMLog '  Skipped by user.' 'WARN'; return 'Skipped' }
+            'Cancel' { Write-HMLog '  Batch cancelled by user.' 'WARN'; return 'CancelBatch' }
+        }
+    }
+
+    return $result
+}
+
+# ---------------------------------------------------------------
+# 2  AD USER SEARCH DIALOG
+# ---------------------------------------------------------------
+function Show-ADPicker {
+    param([string]$Q='')
+    $dlg = [System.Windows.Forms.Form]::new()
+    $dlg.Text            = 'Select Active Directory User'
+    $dlg.Width           = 700; $dlg.Height = 500
+    $dlg.StartPosition   = 'CenterParent'
+    $dlg.BackColor       = $script:HMColors.BG
+    $dlg.ForeColor       = $script:HMColors.FG
+    $dlg.Font            = $script:HMFonts.UI
+    $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.MaximizeBox     = $false
+
+    # Search row
+    $pTop = [System.Windows.Forms.Panel]::new()
+    $pTop.Dock = 'Top'; $pTop.Height = 46; $pTop.BackColor = $script:HMColors.Panel
+    $dlg.Controls.Add($pTop)
+
+    $txt = New-Txt -W 480; $txt.Location = [System.Drawing.Point]::new(8,10); $txt.Text = $Q
+    $pTop.Controls.Add($txt)
+    $btnGo = New-Btn 'Search AD' 110 28 $script:HMColors.Accent
+    $btnGo.Location = [System.Drawing.Point]::new(496,10)
+    $pTop.Controls.Add($btnGo)
+
+    # Legend bar
+    $pLeg = [System.Windows.Forms.Panel]::new()
+    $pLeg.Dock = 'Top'; $pLeg.Height = 28; $pLeg.BackColor = $script:HMColors.Panel
+    $dlg.Controls.Add($pLeg)
+    $lLeg = New-Lbl '  Columns:  Display Name  |  SAM Account Name (login)  |  User Principal Name (UPN / email login)  |  Account Enabled (Yes/No)   -- disabled accounts shown dimmed' -Font $script:HMFonts.Small -Color $script:HMColors.FGDim
+    $lLeg.Location = [System.Drawing.Point]::new(0,8); $pLeg.Controls.Add($lLeg)
+
+    # List
+    $lv = [System.Windows.Forms.ListView]::new()
+    $lv.Dock = 'Fill'; $lv.View = 'Details'; $lv.FullRowSelect = $true
+    $lv.BackColor = $script:HMColors.Card; $lv.ForeColor = $script:HMColors.FG; $lv.Font = $script:HMFonts.UI
+    $lv.GridLines = $true; $lv.BorderStyle = 'None'
+    [void]$lv.Columns.Add('Display Name',          190)
+    [void]$lv.Columns.Add('SAM Account Name',       130)
+    [void]$lv.Columns.Add('User Principal Name (UPN)', 200)
+    [void]$lv.Columns.Add('Acct Enabled',            70)
+    $dlg.Controls.Add($lv)
+
+    # Bottom
+    $pBot = [System.Windows.Forms.Panel]::new()
+    $pBot.Dock = 'Bottom'; $pBot.Height = 42; $pBot.BackColor = $script:HMColors.Panel
+    $dlg.Controls.Add($pBot)
+    $lblN = New-Lbl '0 results' -Color $script:HMColors.FGDim; $lblN.Location = [System.Drawing.Point]::new(8,14)
+    $pBot.Controls.Add($lblN)
+    $btnOK = New-Btn 'Select' 90 30 $script:HMColors.Success
+    $btnOK.Anchor = 'Right,Bottom'; $btnOK.Location = [System.Drawing.Point]::new(590,6)
+    $btnOK.Enabled = $false; $pBot.Controls.Add($btnOK)
+    $btnX = New-Btn 'Cancel' 80 30
+    $btnX.Anchor = 'Right,Bottom'; $btnX.Location = [System.Drawing.Point]::new(502,6)
+    $pBot.Controls.Add($btnX)
+
+    $script:_adPick = $null
+
+    $doSearch = {
+        $q2 = $txt.Text.Trim()
+        if ($q2.Length -lt 1) { return }
+        if ($q2 -notmatch '\*') { $q2 = "*$q2*" }
+        $lv.Items.Clear(); $lblN.Text = 'Searching...'; $dlg.Refresh()
+        try {
+            $props = @('DisplayName','SamAccountName','UserPrincipalName',
+                       'Enabled','ObjectGUID','EmailAddress','GivenName','Surname','DistinguishedName')
+            $users = @(Get-ADUser -Filter {
+                (DisplayName -like $q2) -or (SamAccountName -like $q2) -or
+                (UserPrincipalName -like $q2) -or (EmailAddress -like $q2)
+            } -Properties $props -EA Stop | Select-Object -First 200)
+            foreach ($u in $users) {
+                $li = [System.Windows.Forms.ListViewItem]::new($u.DisplayName)
+                [void]$li.SubItems.Add($u.SamAccountName)
+                [void]$li.SubItems.Add($u.UserPrincipalName)
+                [void]$li.SubItems.Add($(if ($u.Enabled) {'Yes'} else {'No'}))
+                $li.Tag = $u
+                $li.ForeColor = if ($u.Enabled) { $script:HMColors.FG } else { $script:HMColors.FGDim }
+                [void]$lv.Items.Add($li)
+            }
+            $lblN.Text = "$($lv.Items.Count) result(s)"
+        } catch { $lblN.Text = "Error: $_" }
+    }
+
+    $btnGo.Add_Click($doSearch)
+    $txt.Add_KeyDown({ param($s,$e); if ($e.KeyCode -eq 'Return') { & $doSearch } })
+    $lv.Add_SelectedIndexChanged({ $btnOK.Enabled = ($lv.SelectedItems.Count -gt 0) })
+    $lv.Add_DoubleClick({
+        if ($lv.SelectedItems.Count -gt 0) {
+            $script:_adPick = $lv.SelectedItems[0].Tag
+            $dlg.DialogResult = 'OK'; $dlg.Close()
+        }
+    })
+    $btnOK.Add_Click({
+        if ($lv.SelectedItems.Count -gt 0) {
+            $script:_adPick = $lv.SelectedItems[0].Tag
+            $dlg.DialogResult = 'OK'; $dlg.Close()
+        }
+    })
+    $btnX.Add_Click({ $dlg.DialogResult = 'Cancel'; $dlg.Close() })
+
+    if ($Q.Length -ge 2) { & $doSearch }
+    [void]$dlg.ShowDialog()
+    return $script:_adPick
+}
+
+# ---------------------------------------------------------------
+# 3  ENTRA USER SEARCH DIALOG
+# ---------------------------------------------------------------
+function Show-EntraPicker {
+    param([string]$Q='')
+    $dlg = [System.Windows.Forms.Form]::new()
+    $dlg.Text            = 'Select Entra ID User'
+    $dlg.Width           = 780; $dlg.Height = 500
+    $dlg.StartPosition   = 'CenterParent'
+    $dlg.BackColor       = $script:HMColors.BG; $dlg.ForeColor = $script:HMColors.FG
+    $dlg.Font            = $script:HMFonts.UI; $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.MaximizeBox     = $false
+
+    $pTop = [System.Windows.Forms.Panel]::new()
+    $pTop.Dock = 'Top'; $pTop.Height = 46; $pTop.BackColor = $script:HMColors.Panel
+    $dlg.Controls.Add($pTop)
+
+    $txt = New-Txt -W 560; $txt.Location = [System.Drawing.Point]::new(8,10); $txt.Text = $Q
+    $pTop.Controls.Add($txt)
+    $btnGo = New-Btn 'Search Entra' 120 28 $script:HMColors.Accent
+    $btnGo.Location = [System.Drawing.Point]::new(576,10)
+    $pTop.Controls.Add($btnGo)
+
+    # Legend bar
+    $pLeg2 = [System.Windows.Forms.Panel]::new()
+    $pLeg2.Dock = 'Top'; $pLeg2.Height = 38; $pLeg2.BackColor = $script:HMColors.Panel
+    $dlg.Controls.Add($pLeg2)
+    $lLeg2a = New-Lbl '  Columns:  Display Name  |  UPN (Entra login)  |  Account Enabled  |  ImmutableID (Base64 GUID -- links to AD)' -Font $script:HMFonts.Small -Color $script:HMColors.FGDim
+    $lLeg2a.Location = [System.Drawing.Point]::new(0,4); $pLeg2.Controls.Add($lLeg2a)
+    $lLeg2b = New-Lbl '  Yellow rows = already has an ImmutableID (may already be matched to a different AD account -- review carefully before selecting)' -Font $script:HMFonts.Small -Color $script:HMColors.Warning
+    $lLeg2b.Location = [System.Drawing.Point]::new(0,20); $pLeg2.Controls.Add($lLeg2b)
+
+    $lv = [System.Windows.Forms.ListView]::new()
+    $lv.Dock = 'Fill'; $lv.View = 'Details'; $lv.FullRowSelect = $true
+    $lv.BackColor = $script:HMColors.Card; $lv.ForeColor = $script:HMColors.FG; $lv.Font = $script:HMFonts.UI
+    $lv.GridLines = $true; $lv.BorderStyle = 'None'
+    [void]$lv.Columns.Add('Display Name',          195)
+    [void]$lv.Columns.Add('User Principal Name',    230)
+    [void]$lv.Columns.Add('Acct Enabled',            70)
+    [void]$lv.Columns.Add('ImmutableID (existing)',  195)
+    $dlg.Controls.Add($lv)
+
+    $pBot = [System.Windows.Forms.Panel]::new()
+    $pBot.Dock = 'Bottom'; $pBot.Height = 42; $pBot.BackColor = $script:HMColors.Panel
+    $dlg.Controls.Add($pBot)
+    $lblN = New-Lbl '0 results' -Color $script:HMColors.FGDim; $lblN.Location = [System.Drawing.Point]::new(8,14)
+    $pBot.Controls.Add($lblN)
+    $btnOK = New-Btn 'Select' 90 30 $script:HMColors.Success
+    $btnOK.Anchor = 'Right,Bottom'; $btnOK.Location = [System.Drawing.Point]::new(672,6)
+    $btnOK.Enabled = $false; $pBot.Controls.Add($btnOK)
+    $btnX = New-Btn 'Cancel' 80 30
+    $btnX.Anchor = 'Right,Bottom'; $btnX.Location = [System.Drawing.Point]::new(584,6)
+    $pBot.Controls.Add($btnX)
+
+    $script:_entraPick = $null
+
+    $doSearch = {
+        $q2 = $txt.Text.Trim().TrimStart('*').TrimEnd('*')
+        if ($q2.Length -lt 2) { return }
+        $lv.Items.Clear(); $lblN.Text = 'Querying Graph...'; $dlg.Refresh()
+        try {
+            $esc = $q2 -replace "'","''"
+            $filter = "startsWith(displayName,'$esc') or startsWith(userPrincipalName,'$esc') or startsWith(mail,'$esc')"
+            $users = @(Get-MgUser -Filter $filter -Top 100 `
+                -Property Id,DisplayName,UserPrincipalName,AccountEnabled,OnPremisesImmutableId -EA Stop)
+            foreach ($u in $users) {
+                $imm = if ($u.OnPremisesImmutableId) { $u.OnPremisesImmutableId } else { '(none)' }
+                $li = [System.Windows.Forms.ListViewItem]::new($u.DisplayName)
+                [void]$li.SubItems.Add($u.UserPrincipalName)
+                [void]$li.SubItems.Add($(if ($u.AccountEnabled) {'Yes'} else {'No'}))
+                [void]$li.SubItems.Add($imm)
+                $li.Tag = $u
+                $li.ForeColor = if ($u.OnPremisesImmutableId) { $script:HMColors.Warning } else { $script:HMColors.FG }
+                [void]$lv.Items.Add($li)
+            }
+            $lblN.Text = "$($lv.Items.Count) result(s)"
+        } catch { $lblN.Text = "Graph error: $_" }
+    }
+
+    $btnGo.Add_Click($doSearch)
+    $txt.Add_KeyDown({ param($s,$e); if ($e.KeyCode -eq 'Return') { & $doSearch } })
+    $lv.Add_SelectedIndexChanged({ $btnOK.Enabled = ($lv.SelectedItems.Count -gt 0) })
+    $lv.Add_DoubleClick({
+        if ($lv.SelectedItems.Count -gt 0) {
+            $script:_entraPick = $lv.SelectedItems[0].Tag
+            $dlg.DialogResult = 'OK'; $dlg.Close()
+        }
+    })
+    $btnOK.Add_Click({
+        if ($lv.SelectedItems.Count -gt 0) {
+            $script:_entraPick = $lv.SelectedItems[0].Tag
+            $dlg.DialogResult = 'OK'; $dlg.Close()
+        }
+    })
+    $btnX.Add_Click({ $dlg.DialogResult = 'Cancel'; $dlg.Close() })
+
+    if ($Q.Length -ge 2) { & $doSearch }
+    [void]$dlg.ShowDialog()
+    return $script:_entraPick
+}
+
+# ---------------------------------------------------------------
+# 4  OU TREE PICKER DIALOG
+# ---------------------------------------------------------------
+function Show-OUPicker {
+    $dlg = [System.Windows.Forms.Form]::new()
+    $dlg.Text            = 'Select OU for Batch Scan'
+    $dlg.Width           = 560; $dlg.Height = 480
+    $dlg.StartPosition   = 'CenterParent'
+    $dlg.BackColor       = $script:HMColors.BG; $dlg.ForeColor = $script:HMColors.FG
+    $dlg.Font            = $script:HMFonts.UI; $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.MaximizeBox     = $false
+
+    $tv = [System.Windows.Forms.TreeView]::new()
+    $tv.Dock       = 'Fill'
+    $tv.BackColor  = $script:HMColors.Card
+    $tv.ForeColor  = $script:HMColors.FG
+    $tv.Font       = $script:HMFonts.UI
+    $tv.BorderStyle = 'None'
+    $dlg.Controls.Add($tv)
+
+    $pBot = [System.Windows.Forms.Panel]::new()
+    $pBot.Dock = 'Bottom'; $pBot.Height = 42; $pBot.BackColor = $script:HMColors.Panel
+    $dlg.Controls.Add($pBot)
+    $btnOK = New-Btn 'Select OU' 110 30 $script:HMColors.Success
+    $btnOK.Anchor = 'Right,Bottom'; $btnOK.Location = [System.Drawing.Point]::new(436,6)
+    $btnOK.Enabled = $false; $pBot.Controls.Add($btnOK)
+    $btnX = New-Btn 'Cancel' 80 30
+    $btnX.Anchor = 'Right,Bottom'; $btnX.Location = [System.Drawing.Point]::new(348,6)
+    $pBot.Controls.Add($btnX)
+
+    $script:_ouPick = $null
+
+    # Populate tree
+    function Add-OUNode {
+        param($parent, $dn)
+        try {
+            $ous = @(Get-ADOrganizationalUnit -SearchBase $dn -SearchScope OneLevel `
+                   -Filter * -Properties DistinguishedName -EA Stop |
+                   Sort-Object Name)
+            foreach ($ou in $ous) {
+                $node = [System.Windows.Forms.TreeNode]::new($ou.Name)
+                $node.Tag = $ou.DistinguishedName
+                [void]$parent.Nodes.Add($node)
+                Add-OUNode $node $ou.DistinguishedName
+            }
+        } catch {}
+    }
+
+    try {
+        $root = Get-ADDomain -EA Stop
+        $rootNode = [System.Windows.Forms.TreeNode]::new($root.DNSRoot)
+        $rootNode.Tag = $root.DistinguishedName
+        [void]$tv.Nodes.Add($rootNode)
+        Add-OUNode $rootNode $root.DistinguishedName
+        $rootNode.Expand()
+    } catch {
+        [void][System.Windows.Forms.MessageBox]::Show(
+            "Could not load AD structure: $_", 'Error',
+            'OK','Error')
+    }
+
+    $tv.Add_AfterSelect({ $btnOK.Enabled = ($tv.SelectedNode -ne $null) })
+    $tv.Add_NodeMouseDoubleClick({
+        if ($tv.SelectedNode) {
+            $script:_ouPick = $tv.SelectedNode.Tag
+            $dlg.DialogResult = 'OK'; $dlg.Close()
+        }
+    })
+    $btnOK.Add_Click({
+        if ($tv.SelectedNode) {
+            $script:_ouPick = $tv.SelectedNode.Tag
+            $dlg.DialogResult = 'OK'; $dlg.Close()
+        }
+    })
+    $btnX.Add_Click({ $dlg.DialogResult = 'Cancel'; $dlg.Close() })
+
+    [void]$dlg.ShowDialog()
+    return $script:_ouPick
+}
+
+# ---------------------------------------------------------------
+# 5  MAIN FORM
+# ---------------------------------------------------------------
+function Show-HardMatchPage {
+    param($Owner)
+
+    $form = [System.Windows.Forms.Form]::new()
+    $form.Text            = 'AD -> Entra ID Hard Match Tool'
+    $form.Width           = 980
+    $form.Height          = 780
+    $form.MinimumSize     = [System.Drawing.Size]::new(980, 780)
+    $form.StartPosition   = 'CenterParent'
+    $form.BackColor       = $script:HMColors.BG
+    $form.ForeColor       = $script:HMColors.FG
+    $form.Font            = $script:HMFonts.UI
+    $form.FormBorderStyle = 'Sizable'
+
+    # ---------- TITLE BAR ----------
+    $pTitle = [System.Windows.Forms.Panel]::new()
+    $pTitle.Dock = 'Top'; $pTitle.Height = 50; $pTitle.BackColor = $script:HMColors.Panel
+    $form.Controls.Add($pTitle)
+
+    $lblTitle = New-Lbl 'AD  ->  Entra Hard Match Tool' -Font $script:HMFonts.Title -Color $script:HMColors.FGHdr
+    $lblTitle.Location = [System.Drawing.Point]::new(12, 14)
+    $pTitle.Controls.Add($lblTitle)
+
+    $lblWI = New-Lbl '[WHATIF -- NO CHANGES WILL BE WRITTEN]' -Font $script:HMFonts.Hdr -Color $script:HMColors.Warning
+    $lblWI.Location = [System.Drawing.Point]::new(320, 17)
+    $lblWI.Visible  = $WhatIf.IsPresent
+    $pTitle.Controls.Add($lblWI)
+
+    $lblCfg = New-Lbl "Config: $script:ConfigPath" -Font $script:HMFonts.Small -Color $script:HMColors.FGDim
+    $lblCfg.Location = [System.Drawing.Point]::new(12, 34)
+    $pTitle.Controls.Add($lblCfg)
+
+    $btnSetupAuth = New-Btn 'Setup Auth' 120 30 $script:HMColors.Warning
+    $btnSetupAuth.Location = [System.Drawing.Point]::new(820, 10)
+    $btnSetupAuth.Anchor   = 'Top,Right'
+    $pTitle.Controls.Add($btnSetupAuth)
+    $btnSetupAuth.Add_Click({
+        $cfg = Get-CertConfig
+        if ($cfg) {
+            $ans = [System.Windows.Forms.MessageBox]::Show(
+                "Non-interactive auth is already configured.`r`n`r`nApp ID : $($cfg.AppId)`r`nCert   : $($cfg.CertThumbprint)`r`n`r`nRun setup again to replace it?",
+                'Auth Already Configured', 'YesNo', 'Question')
+            if ($ans -ne 'Yes') { return }
+        }
+        $btnSetupAuth.Enabled = $false
+        $ok = Initialize-M365Auth -LogBox $script:HMLogBox
+        $btnSetupAuth.Enabled = $true
+        if ($ok) {
+            Set-Status '[OK] Non-interactive auth configured. Wait 5-10 min then retry.'
+        } else {
+            Set-Status '[X] Setup Auth failed -- see log.'
+        }
+    })
+
+    # ---------- TAB CONTROL ----------
+    $tabs = [System.Windows.Forms.TabControl]::new()
+    $tabs.Dock      = 'Fill'
+    $tabs.BackColor = $script:HMColors.BG
+    $tabs.Font      = $script:HMFonts.UIB
+    $form.Controls.Add($tabs)
+
+    # Bring tabs on top of title bar (Z order)
+    $form.Controls.SetChildIndex($tabs, 0)
+
+    # ---------- STATUS BAR ----------
+    $pStatus = [System.Windows.Forms.Panel]::new()
+    $pStatus.Dock = 'Bottom'; $pStatus.Height = 26; $pStatus.BackColor = $script:HMColors.Panel
+    $form.Controls.Add($pStatus)
+    $lblStatus = New-Lbl 'Ready' -Color $script:HMColors.FGDim; $lblStatus.Location = [System.Drawing.Point]::new(8,5)
+    $pStatus.Controls.Add($lblStatus)
+    $script:LblStatus = $lblStatus
+
+    # ===================================================================
+    # TAB 1 -- SINGLE USER
+    # ===================================================================
+    $tabSingle = [System.Windows.Forms.TabPage]::new('  Single User  ')
+    $tabSingle.BackColor = $script:HMColors.BG; $tabSingle.ForeColor = $script:HMColors.FG
+    [void]$tabs.TabPages.Add($tabSingle)
+
+    # -- AD card --
+    $cardAD = [System.Windows.Forms.Panel]::new()
+    $cardAD.Location = [System.Drawing.Point]::new(12, 12)
+    $cardAD.Size     = [System.Drawing.Size]::new(438, 200)
+    $cardAD.BackColor = $script:HMColors.Card
+    $tabSingle.Controls.Add($cardAD)
+
+    $lADH = New-Lbl 'Active Directory User' -Font $script:HMFonts.Hdr -Color $script:HMColors.Accent
+    $lADH.Location = [System.Drawing.Point]::new(8,8); $cardAD.Controls.Add($lADH)
+
+    $txtADs = New-Txt 300; $txtADs.Location = [System.Drawing.Point]::new(8,32); $cardAD.Controls.Add($txtADs)
+    $btnADs = New-Btn 'Search AD' 112 26 $script:HMColors.Accent; $btnADs.Location = [System.Drawing.Point]::new(316,32); $cardAD.Controls.Add($btnADs)
+
+    $adFields = @{
+        Name  = [System.Drawing.Point]::new(8,72)
+        SAM   = [System.Drawing.Point]::new(8,92)
+        UPN   = [System.Drawing.Point]::new(8,112)
+        GUID  = [System.Drawing.Point]::new(8,132)
+        ImmID = [System.Drawing.Point]::new(8,152)
+        OU    = [System.Drawing.Point]::new(8,172)
+    }
+    $adVals  = @{}
+    $adLabels = @{ Name='Name:'; SAM='SAM:'; UPN='UPN:'; GUID='GUID:'; ImmID='Imm ID:'; OU='OU:' }
+    foreach ($k in $adFields.Keys) {
+        $lKey = New-Lbl $adLabels[$k] -Color $script:HMColors.FGDim; $lKey.Location = $adFields[$k]; $cardAD.Controls.Add($lKey)
+        $lVal = New-Lbl '--' -Color $script:HMColors.FG
+        $lVal.Location = [System.Drawing.Point]::new(68, $adFields[$k].Y)
+        $lVal.MaximumSize = [System.Drawing.Size]::new(364,18)
+        if ($k -in @('GUID','ImmID')) { $lVal.Font = $script:HMFonts.Mono; $lVal.ForeColor = $script:HMColors.FGDim }
+        $cardAD.Controls.Add($lVal)
+        $adVals[$k] = $lVal
+    }
+
+    # arrow
+    $lblArr = New-Lbl '->' -Font ([System.Drawing.Font]::new('Segoe UI',18,[System.Drawing.FontStyle]::Bold)) -Color $script:HMColors.Accent
+    $lblArr.Location = [System.Drawing.Point]::new(460, 90); $tabSingle.Controls.Add($lblArr)
+
+    # -- Entra card --
+    $cardE = [System.Windows.Forms.Panel]::new()
+    $cardE.Location = [System.Drawing.Point]::new(492, 12)
+    $cardE.Size     = [System.Drawing.Size]::new(462, 200)
+    $cardE.BackColor = $script:HMColors.Card
+    $tabSingle.Controls.Add($cardE)
+
+    $lEH = New-Lbl 'Entra ID (Azure AD) User' -Font $script:HMFonts.Hdr -Color $script:HMColors.Accent
+    $lEH.Location = [System.Drawing.Point]::new(8,8); $cardE.Controls.Add($lEH)
+
+    $txtEs = New-Txt 316; $txtEs.Location = [System.Drawing.Point]::new(8,32); $cardE.Controls.Add($txtEs)
+    $btnEs = New-Btn 'Search Entra' 124 26 $script:HMColors.Accent; $btnEs.Location = [System.Drawing.Point]::new(328,32); $cardE.Controls.Add($btnEs)
+
+    $eFields = @{
+        Name  = [System.Drawing.Point]::new(8,72)
+        UPN   = [System.Drawing.Point]::new(8,92)
+        ObjId = [System.Drawing.Point]::new(8,112)
+        ImmID = [System.Drawing.Point]::new(8,132)
+        State = [System.Drawing.Point]::new(8,152)
+        Sync  = [System.Drawing.Point]::new(8,172)
+    }
+    $eVals   = @{}
+    $eLabels = @{ Name='Name:'; UPN='UPN:'; ObjId='Object ID:'; ImmID='Imm ID:'; State='Enabled:'; Sync='Sync State:' }
+    foreach ($k in $eFields.Keys) {
+        $lKey = New-Lbl $eLabels[$k] -Color $script:HMColors.FGDim; $lKey.Location = $eFields[$k]; $cardE.Controls.Add($lKey)
+        $lVal = New-Lbl '--' -Color $script:HMColors.FG
+        $lVal.Location = [System.Drawing.Point]::new(80, $eFields[$k].Y)
+        $lVal.MaximumSize = [System.Drawing.Size]::new(376,18)
+        if ($k -in @('ObjId','ImmID')) { $lVal.Font = $script:HMFonts.Mono; $lVal.ForeColor = $script:HMColors.FGDim }
+        $cardE.Controls.Add($lVal)
+        $eVals[$k] = $lVal
+    }
+
+    # -- Computed preview --
+    $pPrev = [System.Windows.Forms.Panel]::new()
+    $pPrev.Location = [System.Drawing.Point]::new(12, 224)
+    $pPrev.Size     = [System.Drawing.Size]::new(942, 44)
+    $pPrev.BackColor = $script:HMColors.Panel
+    $tabSingle.Controls.Add($pPrev)
+
+    $lPrevHdr = New-Lbl 'Computed ImmutableID (Base64 of AD GUID):' -Font $script:HMFonts.Hdr -Color $script:HMColors.FGHdr
+    $lPrevHdr.Location = [System.Drawing.Point]::new(8,4); $pPrev.Controls.Add($lPrevHdr)
+    $lPrevVal = New-Lbl 'Select an AD user above to compute.' -Font $script:HMFonts.Mono -Color $script:HMColors.FGDim
+    $lPrevVal.Location = [System.Drawing.Point]::new(8,22)
+    $lPrevVal.MaximumSize = [System.Drawing.Size]::new(930,18)
+    $pPrev.Controls.Add($lPrevVal)
+
+    # -- Validation notice --
+    $lblV = New-Lbl '' -Font $script:HMFonts.UIB -Color $script:HMColors.FGDim
+    $lblV.Location = [System.Drawing.Point]::new(12, 278)
+    $lblV.MaximumSize = [System.Drawing.Size]::new(942,60)
+    $tabSingle.Controls.Add($lblV)
+
+    # -- Action row --
+    $pAct = [System.Windows.Forms.Panel]::new()
+    $pAct.Location = [System.Drawing.Point]::new(0, 344)
+    $pAct.Size     = [System.Drawing.Size]::new(962, 50)
+    $pAct.BackColor = $script:HMColors.Panel
+    $tabSingle.Controls.Add($pAct)
+
+    $btnApply  = New-Btn 'Apply Hard Match' 160 36 $script:HMColors.Success; $btnApply.Location  = [System.Drawing.Point]::new(640,7); $btnApply.Enabled = $false
+    $btnClearI = New-Btn 'Clear Entra ImmutableID' 200 36 $script:HMColors.Danger;  $btnClearI.Location = [System.Drawing.Point]::new(430,7); $btnClearI.Enabled = $false
+    $btnClearS = New-Btn 'Clear Selections' 140 36; $btnClearS.Location = [System.Drawing.Point]::new(280,7)
+    $pAct.Controls.AddRange(@($btnApply,$btnClearI,$btnClearS))
+
+    # -- Log (single tab) --
+    $logS = [System.Windows.Forms.RichTextBox]::new()
+    $logS.Location  = [System.Drawing.Point]::new(0, 394)
+    $logS.Size      = [System.Drawing.Size]::new(962, 290)
+    $logS.BackColor = $script:HMColors.LogBG; $logS.ForeColor = $script:HMColors.FG
+    $logS.Font      = $script:HMFonts.Mono; $logS.ReadOnly = $true
+    $logS.BorderStyle = 'None'; $logS.ScrollBars = 'Vertical'
+    $tabSingle.Controls.Add($logS)
+    $script:HMLogBox = $logS
+
+    # ---- single tab: wire validation ----
+    $updateVal = {
+        $btnApply.Enabled  = $false
+        $btnClearI.Enabled = $false
+        if (-not $script:SelAD -or -not $script:SelEntra) {
+            $lblV.Text = 'Select both an AD user and an Entra user to proceed.'
+            $lblV.ForeColor = $script:HMColors.FGDim; return
+        }
+        $cid = Get-ImmutableId -g $script:SelAD.ObjectGUID
+        $eid = $script:SelEntra.OnPremisesImmutableId
+        if ($eid -and $eid -eq $cid) {
+            $lblV.Text = '[OK] ImmutableID already matches -- these accounts are already hard-matched.'
+            $lblV.ForeColor = $script:HMColors.Success
+        } elseif ($eid -and $eid -ne $cid) {
+            $lblV.Text = '[!] Entra user already has a DIFFERENT ImmutableID. Applying will overwrite it.'
+            $lblV.ForeColor = $script:HMColors.Warning
+            $btnApply.Enabled = $true; $btnClearI.Enabled = $true
+        } else {
+            $lblV.Text = '[OK] Ready -- Entra user has no existing ImmutableID.'
+            $lblV.ForeColor = $script:HMColors.Success
+            $btnApply.Enabled = $true
+        }
+    }
+
+    $btnADs.Add_Click({
+        $p = Show-ADPicker -Q $txtADs.Text.Trim()
+        if ($p) {
+            $script:SelAD = $p
+            $adVals['Name'].Text  = $p.DisplayName
+            $adVals['SAM'].Text   = $p.SamAccountName
+            $adVals['UPN'].Text   = $p.UserPrincipalName
+            $adVals['GUID'].Text  = $p.ObjectGUID.ToString()
+            $cid = Get-ImmutableId -g $p.ObjectGUID
+            $adVals['ImmID'].Text = $cid
+            $adVals['OU'].Text    = ($p.DistinguishedName -replace '^[^,]+,','')
+            $lPrevVal.Text      = $cid; $lPrevVal.ForeColor = $script:HMColors.Accent
+            if (-not $txtEs.Text.Trim()) { $txtEs.Text = $p.DisplayName }
+            Set-Status "AD user selected: $($p.DisplayName)"
+            & $updateVal
+        }
+    })
+
+    $btnEs.Add_Click({
+        $p = Show-EntraPicker -Q $txtEs.Text.Trim()
+        if ($p) {
+            $script:SelEntra = $p
+            $imm = if ($p.OnPremisesImmutableId) { $p.OnPremisesImmutableId } else { '(none)' }
+            $eVals['Name'].Text  = $p.DisplayName
+            $eVals['UPN'].Text   = $p.UserPrincipalName
+            $eVals['ObjId'].Text = $p.Id
+            $eVals['ImmID'].Text = $imm
+            $eVals['ImmID'].ForeColor = if ($p.OnPremisesImmutableId) { $script:HMColors.Warning } else { $script:HMColors.FGDim }
+            $eVals['State'].Text = if ($p.AccountEnabled) { 'Yes' } else { 'No' }
+            $eVals['Sync'].Text  = if ($p.OnPremisesImmutableId) { 'Has ImmutableID' } else { 'Cloud-only / No ImmutableID' }
+            if (-not $txtADs.Text.Trim()) { $txtADs.Text = $p.DisplayName }
+            Set-Status "Entra user selected: $($p.DisplayName)"
+            & $updateVal
+        }
+    })
+
+    $btnApply.Add_Click({
+        if (-not $script:SelAD -or -not $script:SelEntra) { return }
+        $cid = Get-ImmutableId -g $script:SelAD.ObjectGUID
+        $msg  = "Apply hard match?`r`n`r`n"
+        $msg += "AD User   : $($script:SelAD.DisplayName) ($($script:SelAD.SamAccountName))`r`n"
+        $msg += "Entra User: $($script:SelEntra.DisplayName) ($($script:SelEntra.UserPrincipalName))`r`n`r`n"
+        $msg += "ImmutableID to set:`r`n$cid"
+        if ($script:SelEntra.OnPremisesImmutableId) { $msg += "`r`n`r`nWARNING: Existing ImmutableID will be overwritten." }
+        if ($WhatIf) { $msg += "`r`n`r`n[WHATIF] No changes will be written." }
+        $r = [System.Windows.Forms.MessageBox]::Show($msg,'Confirm Hard Match','YesNo','Question')
+        if ($r -ne 'Yes') { return }
+        Set-Status 'Applying hard match...'
+        $res = Invoke-HardMatch -ADUser $script:SelAD -EntraUser $script:SelEntra -WhatIfMode $WhatIf.IsPresent
+        if ($res -eq 'OK' -and -not $WhatIf) {
+            try {
+                $refreshed = Get-MgUser -UserId $script:SelEntra.Id `
+                    -Property Id,DisplayName,UserPrincipalName,AccountEnabled,OnPremisesImmutableId
+                $script:SelEntra = $refreshed
+                $eVals['ImmID'].Text = $refreshed.OnPremisesImmutableId
+                & $updateVal
+            } catch {}
+        }
+        Set-Status $(if ($res -eq 'OK') { 'Match applied.' } elseif ($res -eq 'AlreadyMatched') { 'Already matched.' } else { "Result: $res" })
+    })
+
+    $btnClearI.Add_Click({
+        if (-not $script:SelEntra -or -not $script:SelEntra.OnPremisesImmutableId) { return }
+        $r = [System.Windows.Forms.MessageBox]::Show(
+            "Clear ImmutableID from:`r`n$($script:SelEntra.DisplayName) ($($script:SelEntra.UserPrincipalName))?",
+            'Clear ImmutableID','YesNo','Warning')
+        if ($r -ne 'Yes') { return }
+        if ($WhatIf) { Write-HMLog "[WHATIF] Would clear ImmutableID on $($script:SelEntra.UserPrincipalName)" 'WARN'; return }
+        try {
+            $body = '{"onPremisesImmutableId": null}'
+            Invoke-MgGraphRequest -Method PATCH `
+                -Uri "https://graph.microsoft.com/v1.0/users/$($script:SelEntra.Id)" `
+                -Body $body -ContentType 'application/json'
+            Write-HMLog "ImmutableID cleared on $($script:SelEntra.UserPrincipalName)." 'OK'
+            $refreshed = Get-MgUser -UserId $script:SelEntra.Id `
+                -Property Id,DisplayName,UserPrincipalName,AccountEnabled,OnPremisesImmutableId
+            $script:SelEntra = $refreshed
+            $eVals['ImmID'].Text = '(none)'; $btnClearI.Enabled = $false
+            & $updateVal
+        } catch { Write-HMLog "Clear failed: $_" 'ERR' }
+    })
+
+    $btnClearS.Add_Click({
+        $script:SelAD = $null; $script:SelEntra = $null
+        foreach ($k in $adVals.Keys)  { $adVals[$k].Text = '--' }
+        foreach ($k in $eVals.Keys)   { $eVals[$k].Text  = '--' }
+        $lPrevVal.Text = 'Select an AD user above to compute.'
+        $lPrevVal.ForeColor = $script:HMColors.FGDim
+        $lblV.Text = ''; $btnApply.Enabled = $false; $btnClearI.Enabled = $false
+        Set-Status 'Selections cleared.'
+    })
+
+    # ===================================================================
+    # TAB 2 -- BATCH OU SCAN
+    # ===================================================================
+    $tabBatch = [System.Windows.Forms.TabPage]::new('  Batch (OU Scan)  ')
+    $tabBatch.BackColor = $script:HMColors.BG; $tabBatch.ForeColor = $script:HMColors.FG
+    [void]$tabs.TabPages.Add($tabBatch)
+
+    # -- OU selector row --
+    $pOU = [System.Windows.Forms.Panel]::new()
+    $pOU.Location = [System.Drawing.Point]::new(12,12)
+    $pOU.Size     = [System.Drawing.Size]::new(942,42)
+    $pOU.BackColor = $script:HMColors.Panel
+    $tabBatch.Controls.Add($pOU)
+
+    $lOU = New-Lbl 'OU:' -Font $script:HMFonts.Hdr -Color $script:HMColors.FGHdr; $lOU.Location = [System.Drawing.Point]::new(8,12); $pOU.Controls.Add($lOU)
+    $txtOU = New-Txt 680; $txtOU.Location = [System.Drawing.Point]::new(36,9); $txtOU.Text = $script:Config['DefaultOU']
+    $pOU.Controls.Add($txtOU)
+    $btnPickOU = New-Btn 'Browse OU' 120 26 $script:HMColors.Accent; $btnPickOU.Location = [System.Drawing.Point]::new(720,9); $pOU.Controls.Add($btnPickOU)
+
+    # -- Options row --
+    $pOpts = [System.Windows.Forms.Panel]::new()
+    $pOpts.Location = [System.Drawing.Point]::new(12,62)
+    $pOpts.Size     = [System.Drawing.Size]::new(942,34)
+    $pOpts.BackColor = $script:HMColors.BG
+    $tabBatch.Controls.Add($pOpts)
+
+    $chkEnabled = [System.Windows.Forms.CheckBox]::new()
+    $chkEnabled.Text = 'Enabled users only'; $chkEnabled.Checked = $true
+    $chkEnabled.ForeColor = $script:HMColors.FG; $chkEnabled.BackColor = [System.Drawing.Color]::Transparent
+    $chkEnabled.Location = [System.Drawing.Point]::new(0,6); $chkEnabled.AutoSize = $true
+    $pOpts.Controls.Add($chkEnabled)
+
+    $chkNoImm = [System.Windows.Forms.CheckBox]::new()
+    $chkNoImm.Text = 'Skip already-matched users'; $chkNoImm.Checked = $true
+    $chkNoImm.ForeColor = $script:HMColors.FG; $chkNoImm.BackColor = [System.Drawing.Color]::Transparent
+    $chkNoImm.Location = [System.Drawing.Point]::new(170,6); $chkNoImm.AutoSize = $true
+    $pOpts.Controls.Add($chkNoImm)
+
+    $btnLoad = New-Btn 'Load Users from OU' 180 28 $script:HMColors.Accent; $btnLoad.Location = [System.Drawing.Point]::new(380,4)
+    $pOpts.Controls.Add($btnLoad)
+
+    $btnSelAll  = New-Btn 'Check All'   90 28; $btnSelAll.Location  = [System.Drawing.Point]::new(570,4)
+    $btnSelNone = New-Btn 'Uncheck All' 96 28; $btnSelNone.Location = [System.Drawing.Point]::new(668,4)
+    $pOpts.Controls.Add($btnSelAll); $pOpts.Controls.Add($btnSelNone)
+
+    # -- Checked list --
+    $lv2 = [System.Windows.Forms.ListView]::new()
+    $lv2.Location     = [System.Drawing.Point]::new(12, 104)
+    $lv2.Size         = [System.Drawing.Size]::new(942, 320)
+    $lv2.View         = 'Details'
+    $lv2.CheckBoxes   = $true
+    $lv2.FullRowSelect = $true
+    $lv2.BackColor    = $script:HMColors.Card; $lv2.ForeColor = $script:HMColors.FG
+    $lv2.Font         = $script:HMFonts.UI;  $lv2.GridLines = $true
+    $lv2.BorderStyle  = 'FixedSingle'
+    [void]$lv2.Columns.Add('',             24)   # checkbox spacer
+    [void]$lv2.Columns.Add('AD Display Name',    185)
+    [void]$lv2.Columns.Add('SAM',                110)
+    [void]$lv2.Columns.Add('Entra Match',        195)
+    [void]$lv2.Columns.Add('Confidence',          80)
+    [void]$lv2.Columns.Add('Current Imm ID',     185)
+    [void]$lv2.Columns.Add('Action',              98)
+    $tabBatch.Controls.Add($lv2)
+
+    # -- Batch action row --
+    $pBAct = [System.Windows.Forms.Panel]::new()
+    $pBAct.Location = [System.Drawing.Point]::new(0, 432)
+    $pBAct.Size     = [System.Drawing.Size]::new(962, 50)
+    $pBAct.BackColor = $script:HMColors.Panel
+    $tabBatch.Controls.Add($pBAct)
+
+    $lblSel = New-Lbl '0 users loaded' -Color $script:HMColors.FGDim; $lblSel.Location = [System.Drawing.Point]::new(8,16); $pBAct.Controls.Add($lblSel)
+    $btnResolve = New-Btn 'Re-Resolve Entra' 160 36 $script:HMColors.Accent
+    $btnResolve.Location = [System.Drawing.Point]::new(560,7); $btnResolve.Enabled = $false; $pBAct.Controls.Add($btnResolve)
+    $btnBatchApply = New-Btn 'Apply Checked Matches' 200 36 $script:HMColors.Success
+    $btnBatchApply.Location = [System.Drawing.Point]::new(728,7); $btnBatchApply.Enabled = $false; $pBAct.Controls.Add($btnBatchApply)
+
+    # -- Batch log --
+    $logB = [System.Windows.Forms.RichTextBox]::new()
+    $logB.Location  = [System.Drawing.Point]::new(0, 482)
+    $logB.Size      = [System.Drawing.Size]::new(962, 190)
+    $logB.BackColor = $script:HMColors.LogBG; $logB.ForeColor = $script:HMColors.FG
+    $logB.Font      = $script:HMFonts.Mono; $logB.ReadOnly = $true
+    $logB.BorderStyle = 'None'; $logB.ScrollBars = 'Vertical'
+    $tabBatch.Controls.Add($logB)
+
+    # Switch active log when tab changes
+    $tabs.Add_SelectedIndexChanged({
+        $script:HMLogBox = if ($tabs.SelectedIndex -eq 0) { $logS } else { $logB }
+    })
+
+    # OU browse
+    $btnPickOU.Add_Click({
+        $ou = Show-OUPicker
+        if ($ou) {
+            $txtOU.Text = $ou
+            $script:Config['DefaultOU'] = $ou
+        }
+    })
+
+    # Load users
+    $btnLoad.Add_Click({
+        $script:HMLogBox = $logB
+        $ouDN = $txtOU.Text.Trim()
+        if (-not $ouDN) {
+            [System.Windows.Forms.MessageBox]::Show('Enter or browse to an OU first.','No OU','OK','Warning')
+            return
+        }
+        $lv2.Items.Clear()
+        $btnResolve.Enabled = $false; $btnBatchApply.Enabled = $false
+        $lblSel.Text = 'Loading AD users...'
+        $form.Refresh()
+        try {
+            if ($chkEnabled.Checked) {
+                $adUsers = @(Get-ADUser -SearchBase $ouDN -SearchScope Subtree `
+                    -Filter { Enabled -eq $true } `
+                    -Properties DisplayName,SamAccountName,UserPrincipalName,EmailAddress,`
+                                ObjectGUID,Enabled,DistinguishedName -EA Stop |
+                    Sort-Object DisplayName)
+            } else {
+                $adUsers = @(Get-ADUser -SearchBase $ouDN -SearchScope Subtree `
+                    -Filter * `
+                    -Properties DisplayName,SamAccountName,UserPrincipalName,EmailAddress,`
+                                ObjectGUID,Enabled,DistinguishedName -EA Stop |
+                    Sort-Object DisplayName)
+            }
+            Write-HMLog "Loaded $($adUsers.Count) AD user(s) from $ouDN" 'INFO'
+        } catch {
+            Write-HMLog "Failed to load AD users: $_" 'ERR'
+            $lblSel.Text = 'Load failed.'
+            return
+        }
+
+        if (-not $adUsers -or $adUsers.Count -eq 0) {
+            Write-HMLog 'No users found in this OU (check filter options).' 'WARN'
+            $lblSel.Text = '0 users found.'
+            return
+        }
+
+        Set-Status 'Resolving Entra matches...'
+        $i = 0
+        foreach ($u in $adUsers) {
+            $i++
+            Set-Status "Resolving $i / $($adUsers.Count) ..."
+            $form.Refresh()
+            $res = Resolve-EntraCandidate -ADUser $u
+            $eu  = $res.EntraUser
+            $cid = Get-ImmutableId -g $u.ObjectGUID
+            $currentImm = if ($eu) { $eu.OnPremisesImmutableId } else { $null }
+
+            # Skip already-matched if option set
+            if ($chkNoImm.Checked -and $currentImm -and $currentImm -eq $cid) { continue }
+
+            $action = if ($res.Confidence -eq 'None') { 'No Entra match' }
+                      elseif ($currentImm -and $currentImm -eq $cid) { 'Already matched' }
+                      elseif ($currentImm) { 'Will overwrite' }
+                      else { 'Will match' }
+
+            $li = [System.Windows.Forms.ListViewItem]::new('')
+            [void]$li.SubItems.Add($u.DisplayName)
+            [void]$li.SubItems.Add($u.SamAccountName)
+            [void]$li.SubItems.Add($(if ($eu) { $eu.UserPrincipalName } else { '(not found)' }))
+            [void]$li.SubItems.Add($res.Confidence)
+            [void]$li.SubItems.Add($(if ($currentImm) { $currentImm } else { '(none)' }))
+            [void]$li.SubItems.Add($action)
+            $li.Tag = @{ ADUser=$u; EntraUser=$eu; Confidence=$res.Confidence; Action=$action }
+
+            # Color coding
+            $li.ForeColor = switch ($res.Confidence) {
+                'Exact' { $script:HMColors.FG }
+                'Name'  { $script:HMColors.Warning }
+                default { $script:HMColors.FGDim }
+            }
+
+            # Auto-check rows with an Exact match that need matching
+            $li.Checked = ($res.Confidence -eq 'Exact' -and $action -eq 'Will match')
+            [void]$lv2.Items.Add($li)
+        }
+
+        $total   = $lv2.Items.Count
+        # @(...) forces array context -- Where-Object with zero matches returns
+        # $null, and $null.Count throws under Set-StrictMode -Version Latest
+        # (normally PowerShell auto-resolves .Count on $null to 0, but strict
+        # mode disables that convenience).
+        $checked = @($lv2.Items | Where-Object { $_.Checked }).Count
+        $lblSel.Text = "$total user(s) listed  |  $checked checked"
+        $btnResolve.Enabled     = ($total -gt 0)
+        $btnBatchApply.Enabled  = ($checked -gt 0)
+        Set-Status "Loaded $total user(s)."
+    })
+
+    # Update count label on check change
+    $lv2.Add_ItemChecked({
+        $total   = $lv2.Items.Count
+        # @(...) forces array context -- Where-Object with zero matches returns
+        # $null, and $null.Count throws under Set-StrictMode -Version Latest
+        # (normally PowerShell auto-resolves .Count on $null to 0, but strict
+        # mode disables that convenience).
+        $checked = @($lv2.Items | Where-Object { $_.Checked }).Count
+        $lblSel.Text = "$total user(s) listed  |  $checked checked"
+        $btnBatchApply.Enabled = ($checked -gt 0)
+    })
+
+    $btnSelAll.Add_Click({
+        foreach ($li in $lv2.Items) {
+            if ($li.Tag.EntraUser -ne $null) { $li.Checked = $true }
+        }
+    })
+    $btnSelNone.Add_Click({ foreach ($li in $lv2.Items) { $li.Checked = $false } })
+
+    # Re-resolve
+    $btnResolve.Add_Click({
+        $script:HMLogBox = $logB
+        $i = 0
+        foreach ($li in $lv2.Items) {
+            $i++; Set-Status "Re-resolving $i / $($lv2.Items.Count) ..."
+            $form.Refresh()
+            $td  = $li.Tag
+            $res = Resolve-EntraCandidate -ADUser $td.ADUser
+            $eu  = $res.EntraUser
+            $cid = Get-ImmutableId -g $td.ADUser.ObjectGUID
+            $currentImm = if ($eu) { $eu.OnPremisesImmutableId } else { $null }
+            $action = if ($res.Confidence -eq 'None') { 'No Entra match' }
+                      elseif ($currentImm -and $currentImm -eq $cid) { 'Already matched' }
+                      elseif ($currentImm) { 'Will overwrite' }
+                      else { 'Will match' }
+            $li.SubItems[3].Text = if ($eu) { $eu.UserPrincipalName } else { '(not found)' }
+            $li.SubItems[4].Text = $res.Confidence
+            $li.SubItems[5].Text = if ($currentImm) { $currentImm } else { '(none)' }
+            $li.SubItems[6].Text = $action
+            $li.Tag = @{ ADUser=$td.ADUser; EntraUser=$eu; Confidence=$res.Confidence; Action=$action }
+            $li.ForeColor = switch ($res.Confidence) { 'Exact' {$script:HMColors.FG} 'Name' {$script:HMColors.Warning} default {$script:HMColors.FGDim} }
+        }
+        Set-Status 'Re-resolve complete.'
+    })
+
+    # Batch Apply
+    $btnBatchApply.Add_Click({
+        $script:HMLogBox = $logB
+        $toApply = @($lv2.Items | Where-Object { $_.Checked -and $_.Tag.EntraUser -ne $null })
+        if ($toApply.Count -eq 0) {
+            [System.Windows.Forms.MessageBox]::Show('No valid checked rows to process.','Nothing to do','OK','Information')
+            return
+        }
+
+        # Confirm
+        $names = ($toApply | Select-Object -First 8 | ForEach-Object { "  $($_.Tag.ADUser.DisplayName) -> $($_.Tag.EntraUser.UserPrincipalName)" }) -join "`r`n"
+        if ($toApply.Count -gt 8) { $names += "`r`n  ... and $($toApply.Count - 8) more" }
+        $msg = "Apply hard match for $($toApply.Count) user(s)?`r`n`r`n$names"
+        if ($WhatIf) { $msg += "`r`n`r`n[WHATIF] No changes will be written." }
+        $r = [System.Windows.Forms.MessageBox]::Show($msg,'Confirm Batch Match','YesNo','Question')
+        if ($r -ne 'Yes') { return }
+
+        $ok=0; $skip=0; $fail=0; $cancelled=$false
+        $btnBatchApply.Enabled = $false
+        foreach ($li in $toApply) {
+            if ($cancelled) { break }
+            $td = $li.Tag
+            Write-HMLog "--- $($td.ADUser.DisplayName) ---" 'INFO'
+            $res = Invoke-HardMatch -ADUser $td.ADUser -EntraUser $td.EntraUser `
+                       -WhatIfMode $WhatIf.IsPresent -AllowConflictUI $true
+            switch ($res) {
+                'OK'            { $ok++;   $li.SubItems[6].Text = 'Matched';         $li.ForeColor = $script:HMColors.Success }
+                'AlreadyMatched'{ $skip++; $li.SubItems[6].Text = 'Already matched'; $li.ForeColor = $script:HMColors.FGDim }
+                'WhatIf'        { $skip++; $li.SubItems[6].Text = 'WhatIf';          $li.ForeColor = $script:HMColors.Warning }
+                'Skipped'       { $skip++; $li.SubItems[6].Text = 'Skipped';         $li.ForeColor = $script:HMColors.FGDim }
+                'Conflict'      { $fail++; $li.SubItems[6].Text = 'Conflict -- manual resolve needed'; $li.ForeColor = $script:HMColors.Danger }
+                'CancelBatch'   {
+                    $cancelled = $true
+                    $li.SubItems[6].Text = 'Cancelled'
+                    $li.ForeColor = $script:HMColors.FGDim
+                    Write-HMLog 'Batch cancelled by user at conflict dialog.' 'WARN'
+                }
+                default         { $fail++; $li.SubItems[6].Text = "Failed: $res";   $li.ForeColor = $script:HMColors.Danger }
+            }
+            $li.Checked = $false
+            $form.Refresh()
+        }
+        $summary = "Batch done: $ok matched  |  $skip skipped  |  $fail failed"
+        if ($cancelled) { $summary += '  |  CANCELLED' }
+        Write-HMLog $summary $(if ($fail -gt 0 -or $cancelled) {'WARN'} else {'OK'})
+        Set-Status $summary
+        $btnBatchApply.Enabled = $false
+    })
+
+    # ===================================================================
+    # FINAL STARTUP LOG
+    # ===================================================================
+    $script:HMLogBox = $logS
+
+    if ($script:StartupLog -and $script:StartupLog.Count -gt 0) {
+        Write-HMLog '--- Startup log (module bootstrap / Graph version-skew repair / Setup Auth / initial Connect-ToGraph) ---' 'INFO'
+        foreach ($entry in $script:StartupLog) { Write-HMLog $entry.Message $entry.Level }
+        Write-HMLog '--- End startup log ---' 'INFO'
+    }
+
+    Write-HMLog 'Hard Match Tool ready.' 'OK'
+    Write-HMLog "Config file: $script:ConfigPath" 'INFO'
+    if ($WhatIf) { Write-HMLog 'WhatIf mode -- no changes will be written.' 'WARN' }
+
+    [void]$form.ShowDialog($Owner)
+}
 function Show-ScanPage       { param($Owner) Write-Log "Scan page not yet implemented in the combined toolbox - use Find-InactiveLicensedUsers.ps1 directly for now." "WARN" $script:launcherLog }
 
 # ============================================================
