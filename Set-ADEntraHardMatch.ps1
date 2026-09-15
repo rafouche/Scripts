@@ -1175,7 +1175,19 @@ function Invoke-HardMatch {
                 -OnPremisesImmutableId $targetId -EA Stop
         } catch {
             $msg = Get-SafeErrorText $_
-            if ($msg -match 'onPremisesImmutableId' -and $msg -match '400') {
+            # Confirmed live: Update-MgUser's actual exception text for this
+            # exact conflict is "[Request_BadRequest] : Another object with
+            # the same value for property onPremisesImmutableId already
+            # exists." - it never contains the literal "400" this check also
+            # required, so the AND condition silently failed and every real
+            # conflict fell through to the generic FAILED/'Error' path below
+            # instead of ever reaching the Find-ImmutableIdOwner/
+            # Show-ConflictDialog resolution flow it's supposed to. Matching
+            # on the actual wording (in addition to, not instead of, the
+            # original check, in case some other Graph client surfaces a
+            # differently-worded 400) is safer than requiring both.
+            if ($msg -match 'onPremisesImmutableId' -and
+                ($msg -match '400' -or $msg -match 'already exists' -or $msg -match 'Request_BadRequest')) {
                 return 'Conflict'
             }
             Write-Log "  FAILED: $msg" 'ERR'
