@@ -1023,20 +1023,17 @@ function Resolve-EntraCandidate {
 # ---------------------------------------------------------------
 function Find-ImmutableIdOwner {
     param([string]$ImmutableId)
+    $enc     = [Uri]::EscapeDataString($ImmutableId)
+    $headers = @{ ConsistencyLevel = 'eventual' }
+
+    # onPremisesImmutableId is not natively indexed for $filter eq - like
+    # signInActivity elsewhere in this codebase, Graph requires the advanced
+    # query combo (ConsistencyLevel: eventual header + $count=true) or it
+    # silently returns zero results instead of throwing.
     try {
-        # Encode the value for safe URL use
-        $enc = [Uri]::EscapeDataString($ImmutableId)
-        # onPremisesImmutableId is not natively indexed for $filter eq - like
-        # signInActivity elsewhere in this codebase, Graph requires the
-        # advanced query combo (ConsistencyLevel: eventual header + $count=
-        # true) or it silently returns zero results instead of throwing,
-        # even when a genuine conflicting object exists (confirmed live: the
-        # write itself failed with "already exists", proving an owner is out
-        # there, while this query without the header came back empty).
         $resp = Invoke-MgGraphRequest -Method GET `
             -Uri "https://graph.microsoft.com/v1.0/users?`$filter=onPremisesImmutableId eq '$enc'&`$count=true&`$select=id,displayName,userPrincipalName,accountEnabled,onPremisesImmutableId" `
-            -Headers @{ ConsistencyLevel = 'eventual' } `
-            -EA Stop
+            -Headers $headers -EA Stop
         $vals = @($resp.value)   # force array -- Graph may return bare object
         if ($vals.Count -gt 0) {
             return $vals[0]
@@ -1044,6 +1041,29 @@ function Find-ImmutableIdOwner {
     } catch {
         Write-Log "  Conflict search error: $_" 'WARN'
     }
+
+    # Still not found among active users - confirmed live this can still
+    # happen even with the header fix above when the real owner is a
+    # SOFT-DELETED user. Entra keeps a deleted user's onPremisesImmutableId
+    # reserved for up to 30 days in the recycle bin, silently blocking
+    # reassignment to any live account until that object is restored+
+    # cleared or permanently purged - and /users never returns deleted
+    # objects no matter how this filter is written. Check the recycle bin
+    # explicitly before giving up.
+    try {
+        $resp = Invoke-MgGraphRequest -Method GET `
+            -Uri "https://graph.microsoft.com/v1.0/directory/deletedItems/microsoft.graph.user?`$filter=onPremisesImmutableId eq '$enc'&`$count=true&`$select=id,displayName,userPrincipalName,accountEnabled,onPremisesImmutableId" `
+            -Headers $headers -EA Stop
+        $vals = @($resp.value)
+        if ($vals.Count -gt 0) {
+            $owner = $vals[0]
+            $owner['IsDeleted'] = $true
+            return $owner
+        }
+    } catch {
+        Write-Log "  Deleted-items conflict search error: $_" 'WARN'
+    }
+
     return $null
 }
 
@@ -1084,12 +1104,14 @@ function Show-ConflictDialog {
     # Conflict details card
     $pCard = [System.Windows.Forms.Panel]::new()
     $pCard.Location = [System.Drawing.Point]::new(16, 172)
-    $pCard.Size     = [System.Drawing.Size]::new(580, 88)
+    $pCard.Size     = [System.Drawing.Size]::new(580, 106)
     $pCard.BackColor = $C.Card
     $dlg.Controls.Add($pCard)
 
     $lCardHdr = New-Lbl 'Conflicting Entra Account:' -Font $F.Hdr -Color $C.Warning
     $lCardHdr.Location = [System.Drawing.Point]::new(8,6); $pCard.Controls.Add($lCardHdr)
+
+    $isDeleted = [bool]($ConflictUser -and $ConflictUser.IsDeleted)
 
     if ($ConflictUser) {
         $lName = New-Lbl "Display Name : $($ConflictUser.displayName)" -Color $C.FG
@@ -1098,8 +1120,12 @@ function Show-ConflictDialog {
         $lUPN.Location  = [System.Drawing.Point]::new(8,44); $pCard.Controls.Add($lUPN)
         $lID   = New-Lbl "Object ID    : $($ConflictUser.id)" -Font $F.Mono -Color $C.FGDim
         $lID.Location   = [System.Drawing.Point]::new(8,62); $pCard.Controls.Add($lID)
+        if ($isDeleted) {
+            $lDel = New-Lbl 'SOFT-DELETED (in recycle bin) - clearing this requires a permanent purge, not a property edit.' -Color $C.Warning
+            $lDel.Location = [System.Drawing.Point]::new(8,80); $pCard.Controls.Add($lDel)
+        }
     } else {
-        $lNF = New-Lbl 'Conflicting account could not be looked up (may be a contact or deleted object).' -Color $C.Warning
+        $lNF = New-Lbl 'Conflicting account could not be looked up (may be a contact, group, or device object).' -Color $C.Warning
         $lNF.Location = [System.Drawing.Point]::new(8,28); $pCard.Controls.Add($lNF)
     }
 
@@ -1132,7 +1158,33 @@ function Show-ConflictDialog {
     $pBot.Controls.Add($btnCancel)
 
     $btnClear.Add_Click({
-        if ($ConflictUser) {
+        if ($ConflictUser -and $isDeleted) {
+            # A soft-deleted object isn't reachable via /users/{id} at all
+            # (that endpoint 404s for anything in the recycle bin), and
+            # deleted objects don't accept property PATCHes even via their
+            # own /directory/deletedItems/{id} endpoint - the only way to
+            # actually free up the ImmutableID it's still holding is to
+            # permanently purge it. That's a one-way door, so confirm
+            # explicitly before doing it, separate from the dialog's own
+            # already-explicit framing.
+            $r = [System.Windows.Forms.MessageBox]::Show(
+                "This will PERMANENTLY delete the soft-deleted object:`r`n$($ConflictUser.userPrincipalName)`r`n$($ConflictUser.id)`r`n`r`nThis cannot be undone. Continue?",
+                'Permanently Delete?', 'YesNo', 'Warning')
+            if ($r -ne 'Yes') { $script:_conflictResult = 'Skip'; $dlg.DialogResult = 'OK'; $dlg.Close(); return }
+            try {
+                Write-Log "  Permanently deleting soft-deleted conflicting object: $($ConflictUser.userPrincipalName)" 'WARN'
+                Invoke-MgGraphRequest -Method DELETE `
+                    -Uri "https://graph.microsoft.com/v1.0/directory/deletedItems/$($ConflictUser.id)" -EA Stop
+                Write-Log "  Conflict purged: $($ConflictUser.userPrincipalName)." 'OK'
+                $script:_conflictResult = 'Cleared'
+            } catch {
+                Write-Log "  Failed to purge conflict: $_" 'ERR'
+                [System.Windows.Forms.MessageBox]::Show(
+                    "Could not permanently delete the conflicting object:`r`n$_",
+                    'Delete Failed', 'OK', 'Error')
+                $script:_conflictResult = 'Skip'
+            }
+        } elseif ($ConflictUser) {
             try {
                 Write-Log "  Clearing ImmutableID from conflicting account: $($ConflictUser.userPrincipalName)" 'WARN'
                 $body = '{"onPremisesImmutableId": null}'
