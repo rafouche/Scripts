@@ -1907,10 +1907,161 @@ $script:SelectedGroups   = @("Domain Users")
 $script:SelectedLicenses = @()
 $script:SelectedManager  = $null
 $script:LastResult       = $null
+$script:CachedLicenses   = @()
+
+$script:LicenseFriendlyNames = @{
+    # Microsoft 365 Business
+    "O365_BUSINESS_ESSENTIALS"              = "Microsoft 365 Business Basic"
+    "O365_BUSINESS_PREMIUM"                 = "Microsoft 365 Business Standard"
+    "SPB"                                   = "Microsoft 365 Business Premium"
+    # Microsoft 365 Enterprise
+    "SPE_E3"                                = "Microsoft 365 E3"
+    "SPE_E5"                                = "Microsoft 365 E5"
+    "SPE_F1"                                = "Microsoft 365 F1"
+    "SPE_F3"                                = "Microsoft 365 F3"
+    # Office 365
+    "ENTERPRISEPACK"                        = "Office 365 E3"
+    "ENTERPRISEPREMIUM"                     = "Office 365 E5"
+    "STANDARDPACK"                          = "Office 365 E1"
+    "DESKLESSPACK"                          = "Office 365 F3"
+    "O365_BUSINESS"                         = "Microsoft 365 Apps for Business"
+    "OFFICESUBSCRIPTION"                    = "Microsoft 365 Apps for Enterprise"
+    # Exchange Online
+    "EXCHANGESTANDARD"                      = "Exchange Online Plan 1"
+    "EXCHANGEENTERPRISE"                    = "Exchange Online Plan 2"
+    "EXCHANGEARCHIVE_ADDON"                 = "Exchange Online Archiving"
+    # Teams
+    "TEAMS_ESSENTIALS"                      = "Microsoft Teams Essentials"
+    "TEAMS_EXPLORATORY"                     = "Microsoft Teams Exploratory"
+    "MCOEV"                                 = "Teams Phone Standard"
+    "MCOPSTN1"                              = "Teams Domestic Calling Plan"
+    "MCOPSTN2"                              = "Teams Domestic and International Calling Plan"
+    "TEAMS_ROOMS_STANDARD"                  = "Teams Rooms Standard"
+    "TEAMS_ROOMS_PRO"                       = "Teams Rooms Pro"
+    # Intune and Endpoint Management
+    "INTUNE_A"                              = "Microsoft Intune Plan 1"
+    "INTUNE_SMB"                            = "Microsoft Intune SMB"
+    # Endpoint Privilege Management (EPM)
+    "INTUNE_P2"                             = "Microsoft Intune Plan 2 (includes EPM)"
+    "INTUNE_SUITE"                          = "Microsoft Intune Suite (EPM + Advanced)"
+    "INTUNE_SUITE_ADO"                      = "Microsoft Intune Suite Add-on"
+    # Enterprise Mobility and Security
+    "EMS"                                   = "Enterprise Mobility + Security E3"
+    "EMSPREMIUM"                            = "Enterprise Mobility + Security E5"
+    # Entra ID
+    "AAD_PREMIUM"                           = "Microsoft Entra ID P1"
+    "AAD_PREMIUM_P2"                        = "Microsoft Entra ID P2"
+    "ENTRA_ID_GOVERNANCE"                   = "Microsoft Entra ID Governance"
+    "ENTRA_SUITE"                           = "Microsoft Entra Suite"
+    # Defender and Security
+    "DEFENDER_ENDPOINT_P1"                  = "Microsoft Defender for Endpoint P1"
+    "MDATP_XPLAT"                           = "Microsoft Defender for Endpoint P2"
+    "ATP_ENTERPRISE"                        = "Microsoft Defender for Office 365 Plan 1"
+    "THREAT_INTELLIGENCE"                   = "Microsoft Defender for Office 365 Plan 2"
+    "MDO_SMB"                               = "Microsoft Defender for Office 365 SMB"
+    "DEFENDER_IDENTITY"                     = "Microsoft Defender for Identity"
+    "ADALLOM_STANDALONE"                    = "Microsoft Defender for Cloud Apps"
+    "DEFENDER_BUSINESS"                     = "Microsoft Defender for Business"
+    "M365_SECURITY_COMPLIANCE_FOR_SMB"      = "Microsoft Defender for Business (bundle)"
+    # Purview and Compliance
+    "RIGHTSMANAGEMENT"                      = "Azure Information Protection P1"
+    "RMS_S_PREMIUM"                         = "Azure Information Protection P1 (alt)"
+    "RMS_S_PREMIUM2"                        = "Azure Information Protection P2"
+    "INFORMATION_PROTECTION_COMPLIANCE"     = "Microsoft Purview Information Protection"
+    "LOCKBOX_ENTERPRISE"                    = "Customer Lockbox"
+    # Windows
+    "WIN10_PRO_ENT_SUB"                     = "Windows 10/11 Enterprise E3"
+    "WIN_ENT_E5"                            = "Windows 10/11 Enterprise E5"
+    "WIN10_VDA_E3"                          = "Windows 10/11 Enterprise E3 VDA"
+    # Power Platform
+    "POWER_BI_PRO"                          = "Power BI Pro"
+    "POWER_BI_PREMIUM_PER_USER"             = "Power BI Premium Per User"
+    "FLOW_FREE"                             = "Power Automate Free"
+    "FLOW_P1"                               = "Power Automate Premium"
+    "POWERAPPS_PER_USER"                    = "Power Apps Premium (per user)"
+    "POWERAPPS_DEV"                         = "Power Apps Developer Plan"
+    # Copilot
+    "COPILOT_FOR_M365"                      = "Microsoft 365 Copilot"
+    "M365_COPILOT"                          = "Microsoft 365 Copilot (alt)"
+    # Project and Visio
+    "PROJECTESSENTIALS"                     = "Project Plan 1"
+    "PROJECTPROFESSIONAL"                   = "Project Plan 3"
+    "PROJECTPREMIUM"                        = "Project Plan 5"
+    "VISIOONLINE_PLAN1"                     = "Visio Plan 1"
+    "VISIOCLIENT"                           = "Visio Plan 2"
+    # Audio Conferencing
+    "MCOMEETADV"                            = "Microsoft 365 Audio Conferencing"
+    # Viva
+    "VIVA_SUITE"                            = "Microsoft Viva Suite"
+}
+
+function Get-M365Licenses {
+    # Ported from Onboard-ADUser.ps1 - was called once at that script's
+    # top-level startup (before its GUI ever built), which is why
+    # $script:CachedLicenses was always already populated by the time its
+    # banner/pickers read it. That startup-only call was missed when
+    # Show-OnboardPage was ported in Phase 4, leaving $script:CachedLicenses
+    # never initialized at all - a Set-StrictMode crash the moment the page
+    # opened. Fixed by calling this at the top of Show-OnboardPage itself
+    # (see below), so it refreshes every time the page opens rather than
+    # once per process lifetime - arguably better for a long-lived toolbox
+    # session than the original's once-per-run behavior.
+    param([bool]$Silent = $false)
+    function LL { param($m, $l = "INFO")
+        if (-not $Silent) {
+            $c = switch ($l) { "OK" { "Green" } "WARN" { "Yellow" } default { "Cyan" } }
+            Write-Host "[$(Get-Date -Format 'HH:mm:ss')][$l] $m" -ForegroundColor $c
+        }
+    }
+
+    LL "Querying M365 license inventory..."
+
+    # Build results as a typed list so only our objects end up in it -
+    # Graph cmdlets can output connection objects to the pipeline which
+    # would otherwise get mixed into the caller's variable.
+    $results = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+    try {
+        $verArgs = @{}
+        if ($script:GraphModuleTargetVersion) { $verArgs['RequiredVersion'] = $script:GraphModuleTargetVersion }
+        $null = Import-Module Microsoft.Graph.Authentication @verArgs -ErrorAction Stop
+        $null = Import-Module Microsoft.Graph.Identity.DirectoryManagement @verArgs -ErrorAction Stop
+
+        # Suppress Connect-MgGraph pipeline output (it returns a context object)
+        Connect-M365Graph -FallbackScopes @("Organization.Read.All")
+
+        $skus = Get-MgSubscribedSku -ErrorAction Stop
+        foreach ($sku in $skus) {
+            $available = $sku.PrepaidUnits.Enabled - $sku.ConsumedUnits
+            $friendly  = $script:LicenseFriendlyNames[$sku.SkuPartNumber]
+            if (-not $friendly) { $friendly = $sku.SkuPartNumber }
+
+            # Use PSCustomObject so .FriendlyName etc. work as true properties
+            $results.Add([PSCustomObject]@{
+                SkuId         = [string]$sku.SkuId
+                SkuPartNumber = [string]$sku.SkuPartNumber
+                FriendlyName  = [string]$friendly
+                Available     = [int]$available
+                Total         = [int]$sku.PrepaidUnits.Enabled
+                Consumed      = [int]$sku.ConsumedUnits
+            })
+            LL "  $friendly - $available available of $($sku.PrepaidUnits.Enabled)" "OK"
+        }
+
+        LL "License query complete. $($results.Count) SKU(s) found." "OK"
+    }
+    catch {
+        LL "License query failed: $_" "WARN"
+    }
+
+    # Return as plain array so callers can index it normally
+    return , $results.ToArray()
+}
 
 function Show-OnboardPage {
     param($Owner)
     try {
+$script:CachedLicenses = Get-M365Licenses -Silent:$false
 $form = New-Object System.Windows.Forms.Form
 $form.Text = "AD/M365 User Onboarding Tool"
 $form.Size = [System.Drawing.Size]::new(860, 660)
