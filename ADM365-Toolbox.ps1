@@ -3628,7 +3628,13 @@ function Show-ADPicker {
     })
     $btnX.Add_Click({ $dlg.DialogResult = 'Cancel'; $dlg.Close() })
 
-    if ($Q.Length -ge 2) { & $doSearch }
+    # Deferred to Shown, not called eagerly here -- populating a ListView
+    # before its native window handle exists (i.e. before the dialog is
+    # actually shown) is a well-known WinForms gotcha: items get added to
+    # the .Items collection fine (Count is correct) but never get properly
+    # realized/painted or hit-tested, so the grid looks blank and nothing
+    # can be selected until some other event forces a relayout.
+    if ($Q.Length -ge 2) { $dlg.Add_Shown({ & $doSearch }) }
     [void]$dlg.ShowDialog()
     return $script:_adPick
 }
@@ -3729,7 +3735,9 @@ function Show-EntraPicker {
     })
     $btnX.Add_Click({ $dlg.DialogResult = 'Cancel'; $dlg.Close() })
 
-    if ($Q.Length -ge 2) { & $doSearch }
+    # Deferred to Shown -- see Show-ADPicker for why this can't run eagerly
+    # before ShowDialog() (blank/unselectable ListView bug).
+    if ($Q.Length -ge 2) { $dlg.Add_Shown({ & $doSearch }) }
     [void]$dlg.ShowDialog()
     return $script:_entraPick
 }
