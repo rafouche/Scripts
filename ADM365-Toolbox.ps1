@@ -3605,17 +3605,24 @@ function Show-ADPicker {
                 (DisplayName -like $q2) -or (SamAccountName -like $q2) -or
                 (UserPrincipalName -like $q2) -or (EmailAddress -like $q2)
             } -Properties $props -EA Stop | Select-Object -First 200)
-            foreach ($u in $users) {
-                $li = [System.Windows.Forms.ListViewItem]::new($u.DisplayName)
-                [void]$li.SubItems.Add($u.SamAccountName)
-                [void]$li.SubItems.Add($u.UserPrincipalName)
-                [void]$li.SubItems.Add($(if ($u.Enabled) {'Yes'} else {'No'}))
-                $li.Tag = $u
-                $li.ForeColor = if ($u.Enabled) { $script:HMColors.FG } else { $script:HMColors.FGDim }
-                [void]$lv.Items.Add($li)
-            }
+            # BeginUpdate/EndUpdate: the Dock-order fix alone did not resolve
+            # the blank/unselectable grid reported live - suppress redraw
+            # while bulk-adding, then force one full repaint below.
+            $lv.BeginUpdate()
+            try {
+                foreach ($u in $users) {
+                    $li = [System.Windows.Forms.ListViewItem]::new($u.DisplayName)
+                    [void]$li.SubItems.Add($u.SamAccountName)
+                    [void]$li.SubItems.Add($u.UserPrincipalName)
+                    [void]$li.SubItems.Add($(if ($u.Enabled) {'Yes'} else {'No'}))
+                    $li.Tag = $u
+                    $li.ForeColor = if ($u.Enabled) { $script:HMColors.FG } else { $script:HMColors.FGDim }
+                    [void]$lv.Items.Add($li)
+                }
+            } finally { $lv.EndUpdate() }
             $lblN.Text = "$($lv.Items.Count) result(s)"
         } catch { $lblN.Text = "Error: $_" }
+        $lv.Invalidate($true); $lv.Update()
     }
 
     $btnGo.Add_Click($doSearch)
@@ -3641,7 +3648,15 @@ function Show-ADPicker {
     # the .Items collection fine (Count is correct) but never get properly
     # realized/painted or hit-tested, so the grid looks blank and nothing
     # can be selected until some other event forces a relayout.
-    if ($Q.Length -ge 2) { $dlg.Add_Shown({ & $doSearch }) }
+    #
+    # Running doSearch SYNCHRONOUSLY inside the Shown handler still wasn't
+    # enough on its own (confirmed live) - Shown fires once the handle
+    # exists, but not necessarily after the dialog's first real paint
+    # cycle has actually run. BeginInvoke posts the search to the UI
+    # thread's own message queue instead of running it inline, so it
+    # executes only once the Shown event (and whatever paint messages
+    # queued alongside it) has fully drained.
+    if ($Q.Length -ge 2) { $dlg.Add_Shown({ $dlg.BeginInvoke([System.Action]{ & $doSearch }) | Out-Null }) }
     [void]$dlg.ShowDialog()
     return $script:_adPick
 }
@@ -3730,18 +3745,24 @@ function Show-EntraPicker {
             $filter = "startsWith(displayName,'$esc') or startsWith(userPrincipalName,'$esc') or startsWith(mail,'$esc')"
             $users = @(Get-MgUser -Filter $filter -Top 100 `
                 -Property Id,DisplayName,UserPrincipalName,AccountEnabled,OnPremisesImmutableId -EA Stop)
-            foreach ($u in $users) {
-                $imm = if ($u.OnPremisesImmutableId) { $u.OnPremisesImmutableId } else { '(none)' }
-                $li = [System.Windows.Forms.ListViewItem]::new($u.DisplayName)
-                [void]$li.SubItems.Add($u.UserPrincipalName)
-                [void]$li.SubItems.Add($(if ($u.AccountEnabled) {'Yes'} else {'No'}))
-                [void]$li.SubItems.Add($imm)
-                $li.Tag = $u
-                $li.ForeColor = if ($u.OnPremisesImmutableId) { $script:HMColors.Warning } else { $script:HMColors.FG }
-                [void]$lv.Items.Add($li)
-            }
+            # BeginUpdate/EndUpdate: the Dock-order fix alone did not resolve
+            # the blank/unselectable grid reported live - see Show-ADPicker.
+            $lv.BeginUpdate()
+            try {
+                foreach ($u in $users) {
+                    $imm = if ($u.OnPremisesImmutableId) { $u.OnPremisesImmutableId } else { '(none)' }
+                    $li = [System.Windows.Forms.ListViewItem]::new($u.DisplayName)
+                    [void]$li.SubItems.Add($u.UserPrincipalName)
+                    [void]$li.SubItems.Add($(if ($u.AccountEnabled) {'Yes'} else {'No'}))
+                    [void]$li.SubItems.Add($imm)
+                    $li.Tag = $u
+                    $li.ForeColor = if ($u.OnPremisesImmutableId) { $script:HMColors.Warning } else { $script:HMColors.FG }
+                    [void]$lv.Items.Add($li)
+                }
+            } finally { $lv.EndUpdate() }
             $lblN.Text = "$($lv.Items.Count) result(s)"
         } catch { $lblN.Text = "Graph error: $_" }
+        $lv.Invalidate($true); $lv.Update()
     }
 
     $btnGo.Add_Click($doSearch)
@@ -3761,9 +3782,10 @@ function Show-EntraPicker {
     })
     $btnX.Add_Click({ $dlg.DialogResult = 'Cancel'; $dlg.Close() })
 
-    # Deferred to Shown -- see Show-ADPicker for why this can't run eagerly
-    # before ShowDialog() (blank/unselectable ListView bug).
-    if ($Q.Length -ge 2) { $dlg.Add_Shown({ & $doSearch }) }
+    # Deferred to Shown, then posted via BeginInvoke -- see Show-ADPicker for
+    # the full explanation of why a synchronous call from Shown wasn't
+    # enough on its own (blank/unselectable ListView bug).
+    if ($Q.Length -ge 2) { $dlg.Add_Shown({ $dlg.BeginInvoke([System.Action]{ & $doSearch }) | Out-Null }) }
     [void]$dlg.ShowDialog()
     return $script:_entraPick
 }
