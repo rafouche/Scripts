@@ -3562,7 +3562,7 @@ function Show-ADPicker {
 
     # List
     $lv = [System.Windows.Forms.ListView]::new()
-    $lv.Dock = 'Fill'; $lv.View = 'Details'; $lv.FullRowSelect = $true
+    $lv.View = 'Details'; $lv.FullRowSelect = $true
     $lv.BackColor = $script:HMColors.Card; $lv.ForeColor = $script:HMColors.FG; $lv.Font = $script:HMFonts.UI
     $lv.GridLines = $true; $lv.BorderStyle = 'None'
     [void]$lv.Columns.Add('Display Name',          190)
@@ -3583,12 +3583,21 @@ function Show-ADPicker {
     $btnX.Anchor = 'Right,Bottom'; $btnX.Location = [System.Drawing.Point]::new(502,6)
     $pBot.Controls.Add($btnX)
 
-    # Dock='Fill' controls must be the LAST control added to the parent's
-    # Controls collection (documented .NET behavior) or the docking layout
-    # comes out wrong - this was the real cause of the blank/unselectable
-    # grid, not (only) the pre-ShowDialog handle-creation timing the
-    # earlier fix addressed. $lv was previously added here, before $pBot -
-    # moved below so it's added last.
+    # Three separate fixes targeting Dock='Fill'/timing all failed to
+    # resolve the blank/unselectable grid, confirmed live even with a
+    # manual re-search on an already-idle, fully-shown dialog - ruling out
+    # every timing theory. Dock='Top'/'Bottom' on $pTop/$pLeg/$pBot is
+    # visibly working fine, so the problem is specific to Dock='Fill' on
+    # this ListView. Replaced it with the exact static-bounds pattern
+    # already proven to work for the always-good batch-tab grid in
+    # Show-HardMatchPage - this dialog is FormBorderStyle='FixedDialog'
+    # (non-resizable), so a fixed size computed from the sibling panels'
+    # own already-correct bounds is exactly equivalent to Fill here, with
+    # no reliance on Dock at all.
+    $topY = [Math]::Max($pTop.Bottom, $pLeg.Bottom)
+    $lv.Anchor   = 'Top,Bottom,Left,Right'
+    $lv.Location = [System.Drawing.Point]::new(0, $topY)
+    $lv.Size     = [System.Drawing.Size]::new($dlg.ClientSize.Width, ($dlg.ClientSize.Height - $topY - $pBot.Height))
     $dlg.Controls.Add($lv)
 
     $script:_adPick = $null
@@ -3694,7 +3703,7 @@ function Show-EntraPicker {
     $lLeg2b.Location = [System.Drawing.Point]::new(0,20); $pLeg2.Controls.Add($lLeg2b)
 
     $lv = [System.Windows.Forms.ListView]::new()
-    $lv.Dock = 'Fill'; $lv.View = 'Details'; $lv.FullRowSelect = $true
+    $lv.View = 'Details'; $lv.FullRowSelect = $true
     $lv.BackColor = $script:HMColors.Card; $lv.ForeColor = $script:HMColors.FG; $lv.Font = $script:HMFonts.UI
     $lv.GridLines = $true; $lv.BorderStyle = 'None'
     [void]$lv.Columns.Add('Display Name',          195)
@@ -3714,10 +3723,13 @@ function Show-EntraPicker {
     $btnX.Anchor = 'Right,Bottom'; $btnX.Location = [System.Drawing.Point]::new(584,6)
     $pBot.Controls.Add($btnX)
 
-    # Dock='Fill' controls must be the LAST control added to the parent's
-    # Controls collection (documented .NET behavior) or the docking layout
-    # comes out wrong - see Show-ADPicker for the full explanation. $lv was
-    # previously added here, before $pBot - moved below so it's added last.
+    # Dock='Fill' plus three separate timing-related fixes all failed to
+    # resolve the blank/unselectable grid - see Show-ADPicker for the full
+    # explanation. Replaced with the same static-bounds pattern used there.
+    $topY = [Math]::Max($pTop.Bottom, $pLeg2.Bottom)
+    $lv.Anchor   = 'Top,Bottom,Left,Right'
+    $lv.Location = [System.Drawing.Point]::new(0, $topY)
+    $lv.Size     = [System.Drawing.Size]::new($dlg.ClientSize.Width, ($dlg.ClientSize.Height - $topY - $pBot.Height))
     $dlg.Controls.Add($lv)
 
     $script:_entraPick = $null
@@ -3803,7 +3815,6 @@ function Show-OnboardOUPicker {
     $dlg.MaximizeBox     = $false
 
     $tv = [System.Windows.Forms.TreeView]::new()
-    $tv.Dock       = 'Fill'
     $tv.BackColor  = $script:HMColors.Card
     $tv.ForeColor  = $script:HMColors.FG
     $tv.Font       = $script:HMFonts.UI
@@ -3819,10 +3830,12 @@ function Show-OnboardOUPicker {
     $btnX.Anchor = 'Right,Bottom'; $btnX.Location = [System.Drawing.Point]::new(348,6)
     $pBot.Controls.Add($btnX)
 
-    # Dock='Fill' controls must be the LAST control added to the parent's
-    # Controls collection (documented .NET behavior) or the docking layout
-    # comes out wrong - see Show-ADPicker for the full explanation. $tv was
-    # previously added here, before $pBot.
+    # Dock='Fill' was confirmed unreliable for a populated list control in
+    # this same FixedDialog+Panel shape (see Show-ADPicker) - replaced with
+    # the same static-bounds pattern for consistency.
+    $tv.Anchor   = 'Top,Bottom,Left,Right'
+    $tv.Location = [System.Drawing.Point]::new(0, 0)
+    $tv.Size     = [System.Drawing.Size]::new($dlg.ClientSize.Width, ($dlg.ClientSize.Height - $pBot.Height))
     $dlg.Controls.Add($tv)
 
     $script:_ouPick = $null
