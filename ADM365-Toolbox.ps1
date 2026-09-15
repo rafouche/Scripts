@@ -1323,6 +1323,61 @@ $F_MONO  = New-Object System.Drawing.Font("Consolas", 8.5)
 $F_TITLE = New-Object System.Drawing.Font("Segoe UI Semibold", 14)
 
 # ---- Stub pages (replaced one at a time as each tool is ported in) ----
+function New-TempPassword {
+    # Ported from Onboard-ADUser.ps1 - was missed entirely in the Phase 4
+    # port even though Show-OnboardPage calls it directly at page-open time
+    # (to seed the initial temp-password label) - a Set-StrictMode-style
+    # crash ("term not recognized") the instant the page opened, same class
+    # of porting gap as Get-M365Licenses.
+    $upper   = "ABCDEFGHJKLMNPQRSTUVWXYZ"
+    $lower   = "abcdefghjkmnpqrstuvwxyz"
+    $digits  = "23456789"
+    $special = "!@#$%^"
+    $all     = $upper + $lower + $digits + $special
+
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    $buf = [byte[]]::new(1)
+    function RC { param($cs)
+        do { $rng.GetBytes($buf) } while ($buf[0] -ge (256 - 256 % $cs.Length))
+        $cs[$buf[0] % $cs.Length]
+    }
+
+    $pwd = @((RC $upper), (RC $lower), (RC $digits), (RC $special))
+    for ($i = 4; $i -lt 12; $i++) { $pwd += (RC $all) }
+
+    for ($i = $pwd.Count - 1; $i -gt 0; $i--) {
+        $rng.GetBytes($buf)
+        $j = $buf[0] % ($i + 1)
+        $tmp = $pwd[$i]; $pwd[$i] = $pwd[$j]; $pwd[$j] = $tmp
+    }
+    return ($pwd -join "")
+}
+
+function New-SamAccountName {
+    # Ported from Onboard-ADUser.ps1 - same porting gap as New-TempPassword
+    # above, just not yet hit live since Invoke-Onboarding (its only caller)
+    # only runs once an admin actually submits the Create User form, later
+    # than the page-open crash this call is fixing.
+    param([string]$First, [string]$Last)
+    $norm = { param($s)
+        $s = $s.ToLower()
+        ($s -replace '[^a-z0-9]', '')
+    }
+    $f = (& $norm $First)
+    $l = (& $norm $Last)
+    $base = "$($f.Substring(0, [Math]::Min(1, $f.Length)))$l"
+    if ($base.Length -gt 20) { $base = $base.Substring(0, 20) }
+
+    $candidate = $base
+    $i = 2
+    while (Get-ADUser -Filter "SamAccountName -eq '$candidate'" -ErrorAction SilentlyContinue) {
+        $suffix = "$i"
+        $candidate = "$($base.Substring(0, [Math]::Min($base.Length, 20 - $suffix.Length)))$suffix"
+        $i++
+    }
+    return $candidate
+}
+
 function Invoke-Onboarding {
     param(
         [string]   $FirstName,
