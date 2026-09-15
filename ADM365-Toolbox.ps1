@@ -3569,7 +3569,6 @@ function Show-ADPicker {
     [void]$lv.Columns.Add('SAM Account Name',       130)
     [void]$lv.Columns.Add('User Principal Name (UPN)', 200)
     [void]$lv.Columns.Add('Acct Enabled',            70)
-    $dlg.Controls.Add($lv)
 
     # Bottom
     $pBot = [System.Windows.Forms.Panel]::new()
@@ -3583,6 +3582,14 @@ function Show-ADPicker {
     $btnX = New-Btn 'Cancel' 80 30
     $btnX.Anchor = 'Right,Bottom'; $btnX.Location = [System.Drawing.Point]::new(502,6)
     $pBot.Controls.Add($btnX)
+
+    # Dock='Fill' controls must be the LAST control added to the parent's
+    # Controls collection (documented .NET behavior) or the docking layout
+    # comes out wrong - this was the real cause of the blank/unselectable
+    # grid, not (only) the pre-ShowDialog handle-creation timing the
+    # earlier fix addressed. $lv was previously added here, before $pBot -
+    # moved below so it's added last.
+    $dlg.Controls.Add($lv)
 
     $script:_adPick = $null
 
@@ -3679,7 +3686,6 @@ function Show-EntraPicker {
     [void]$lv.Columns.Add('User Principal Name',    230)
     [void]$lv.Columns.Add('Acct Enabled',            70)
     [void]$lv.Columns.Add('ImmutableID (existing)',  195)
-    $dlg.Controls.Add($lv)
 
     $pBot = [System.Windows.Forms.Panel]::new()
     $pBot.Dock = 'Bottom'; $pBot.Height = 42; $pBot.BackColor = $script:HMColors.Panel
@@ -3693,6 +3699,12 @@ function Show-EntraPicker {
     $btnX.Anchor = 'Right,Bottom'; $btnX.Location = [System.Drawing.Point]::new(584,6)
     $pBot.Controls.Add($btnX)
 
+    # Dock='Fill' controls must be the LAST control added to the parent's
+    # Controls collection (documented .NET behavior) or the docking layout
+    # comes out wrong - see Show-ADPicker for the full explanation. $lv was
+    # previously added here, before $pBot - moved below so it's added last.
+    $dlg.Controls.Add($lv)
+
     $script:_entraPick = $null
 
     $doSearch = {
@@ -3700,6 +3712,20 @@ function Show-EntraPicker {
         if ($q2.Length -lt 2) { return }
         $lv.Items.Clear(); $lblN.Text = 'Querying Graph...'; $dlg.Refresh()
         try {
+            # Show-EntraPicker can be opened well after the toolbox's
+            # initial Graph connection (user browses other pages/dialogs
+            # first) - don't assume that session is still alive.
+            # Get-MgContext returning $null is exactly what produces the
+            # SDK's "Authentication needed. Please call Connect-MgGraph."
+            # error; reconnect transparently instead of surfacing that as
+            # a search failure.
+            if (-not (Get-MgContext)) {
+                Write-HMLog 'No active Graph session - reconnecting before search...' 'WARN'
+                if (-not (Connect-ToGraph)) {
+                    $lblN.Text = 'Graph error: reconnect failed - see log / try Setup Auth.'
+                    return
+                }
+            }
             $esc = $q2 -replace "'","''"
             $filter = "startsWith(displayName,'$esc') or startsWith(userPrincipalName,'$esc') or startsWith(mail,'$esc')"
             $users = @(Get-MgUser -Filter $filter -Top 100 `
@@ -3760,7 +3786,6 @@ function Show-OnboardOUPicker {
     $tv.ForeColor  = $script:HMColors.FG
     $tv.Font       = $script:HMFonts.UI
     $tv.BorderStyle = 'None'
-    $dlg.Controls.Add($tv)
 
     $pBot = [System.Windows.Forms.Panel]::new()
     $pBot.Dock = 'Bottom'; $pBot.Height = 42; $pBot.BackColor = $script:HMColors.Panel
@@ -3771,6 +3796,12 @@ function Show-OnboardOUPicker {
     $btnX = New-Btn 'Cancel' 80 30
     $btnX.Anchor = 'Right,Bottom'; $btnX.Location = [System.Drawing.Point]::new(348,6)
     $pBot.Controls.Add($btnX)
+
+    # Dock='Fill' controls must be the LAST control added to the parent's
+    # Controls collection (documented .NET behavior) or the docking layout
+    # comes out wrong - see Show-ADPicker for the full explanation. $tv was
+    # previously added here, before $pBot.
+    $dlg.Controls.Add($tv)
 
     $script:_ouPick = $null
 
