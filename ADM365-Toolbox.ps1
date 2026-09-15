@@ -3462,9 +3462,16 @@ function Find-ImmutableIdOwner {
     try {
         # Encode the value for safe URL use
         $enc = [Uri]::EscapeDataString($ImmutableId)
-        # Graph v1.0: filter users by onPremisesImmutableId
+        # onPremisesImmutableId is not natively indexed for $filter eq - like
+        # signInActivity elsewhere in this codebase, Graph requires the
+        # advanced query combo (ConsistencyLevel: eventual header + $count=
+        # true) or it silently returns zero results instead of throwing,
+        # even when a genuine conflicting object exists (confirmed live: the
+        # write itself failed with "already exists", proving an owner is out
+        # there, while this query without the header came back empty).
         $resp = Invoke-MgGraphRequest -Method GET `
-            -Uri "https://graph.microsoft.com/v1.0/users?`$filter=onPremisesImmutableId eq '$enc'&`$select=id,displayName,userPrincipalName,accountEnabled,onPremisesImmutableId" `
+            -Uri "https://graph.microsoft.com/v1.0/users?`$filter=onPremisesImmutableId eq '$enc'&`$count=true&`$select=id,displayName,userPrincipalName,accountEnabled,onPremisesImmutableId" `
+            -Headers @{ ConsistencyLevel = 'eventual' } `
             -EA Stop
         $vals = @($resp.value)   # force array -- Graph may return bare object
         if ($vals.Count -gt 0) {
@@ -3539,9 +3546,17 @@ function Show-ConflictDialog {
 
     $script:_conflictResult = 'Cancel'
 
-    $btnClear = New-Btn 'Clear Conflict & Retry' 190 34 $script:HMColors.Success
+    $btnClear = New-Btn 'Clear Conflict && Retry' 190 34 $script:HMColors.Success
     $btnClear.Location = [System.Drawing.Point]::new(220, 6)
-    $btnClear.Enabled  = ($ConflictUser -ne $null)
+    if ($ConflictUser -eq $null) {
+        # Flat-styled buttons don't gray themselves out on Enabled=$false -
+        # they kept looking clickable (still full-color green) even though
+        # clicks did nothing, which is exactly what got reported as "the
+        # button doesn't work". Make the disabled state visually obvious.
+        $btnClear.Enabled   = $false
+        $btnClear.BackColor = $script:HMColors.Panel
+        $btnClear.ForeColor = $script:HMColors.FGDim
+    }
     $pBot.Controls.Add($btnClear)
 
     $btnSkip = New-Btn 'Skip This User' 130 34 $script:HMColors.Warning
