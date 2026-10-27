@@ -19,6 +19,11 @@
                    job needs no long timeout. The worker updates the Ninja status field as it goes:
                    Queued, Downloading, Building media, Staging, Staged (or Stage failed / Current).
                    Safe to schedule broadly: current devices exit 0, devices failing readiness exit 10.
+      Upgrade      One-shot alternative to Stage + Finalize: same checks and background download/media
+                   build, then a single setup run (no /SkipFinalize) and an automatic reboot with the
+                   standard warning as soon as setup finishes. Field: Queued, Downloading, Building media,
+                   Upgrading, Upgraded - rebooting. The reboot time is not controlled; use Stage + Finalize
+                   when the reboot must land in a maintenance window.
       Finalize     setup.exe /Finalize, registers the post-upgrade task, schedules the reboot.
                    Devices that are not staged are skipped with exit 0, so it is safe to schedule broadly.
       PostUpgrade  Run by the startup task after the upgrade: re-applies OOBE suppression, cleans up
@@ -29,7 +34,8 @@
     Self-contained: all settings live in the CONFIGURATION block below. No external files.
     Setting resolution order: CLI parameter, then NinjaOne script variable (environment variable),
     then the CONFIGURATION block.
-      NinjaOne script variables:  mode (dropdown), force (checkbox), catalogUrl (text, optional override)
+      NinjaOne script variables:  mode (dropdown), force (checkbox), catalogUrl (text, optional override),
+                                  migrateDrivers (dropdown All/None, optional per-run override for Stage)
 
 .EXIT CODES
      0  Success, nothing to do, or in progress (see Ninja status field for detail)
@@ -54,6 +60,7 @@
 param(
     [string]$Mode,
     [string]$CatalogUrl,
+    [string]$MigrateDrivers,
     [switch]$Force
 )
 
@@ -71,7 +78,7 @@ function Resolve-Setting {
     return $Default
 }
 
-$ValidModes = @('Check','Download','Scan','Stage','StageWorker','Finalize','PostUpgrade','Status','Cleanup')
+$ValidModes = @('Check','Download','Scan','Stage','Upgrade','StageWorker','Finalize','PostUpgrade','Status','Cleanup')
 $RawMode = Resolve-Setting -CliValue $Mode -EnvName 'mode' -Default 'Check'
 # Tolerate preset-parameter styles such as "mode=Stage", "-Mode Stage" or "Mode: Stage".
 $m = [regex]::Match("$RawMode", '^(?i)\s*-?mode\s*[=: ]\s*([A-Za-z]+)')
@@ -137,6 +144,7 @@ $Config = @{
         FinalizeTimeoutMinutes = 60
         StageSuccessCodes      = @('0x00000000')
         FinalizeSuccessCodes   = @('0x00000000')
+        UpgradeSuccessCodes    = @('0x00000000', '0x00000BC2', '0x80070BC2')   # one-shot Upgrade mode (0xBC2 = reboot required)
     }
     Customization = @{
         UnattendPath                = ''   # local, UNC or https
@@ -203,7 +211,7 @@ $SetupCodeMap = @{
     '0xC1900208' = 'Incompatible app blocking upgrade. See compat XML in setup logs.'
     '0xC190020E' = 'Not enough free disk space.'
     '0xC1900210' = 'Compatibility scan: no issues found.'
-    '0x80070003' = 'Path not found. Often a leftover or interrupted $WINDOWS.~BT from an earlier attempt, or a path setup needed was removed. Run Status for log details.'
+    '0x80070003' = 'Path not found. Usually a damaged driver store or component store on the device (see setuperr.log via Status). Repair with DISM/SFC, or retry with migrateDrivers = None.'
 }
 
 function Get-CodeDescription {
@@ -503,6 +511,8 @@ function Copy-SelfToWorkRoot {
 }
 
 # Optional override of the media catalog location (CLI -> Ninja var -> CONFIGURATION block)
+$ovMig = Resolve-Setting -CliValue $MigrateDrivers -EnvName 'migrateDrivers' -Default ''
+if ($ovMig -in @('All','None')) { $Config.Setup.MigrateDrivers = $ovMig }
 $ovCatalog = Resolve-Setting -CliValue $CatalogUrl -EnvName 'catalogUrl' -Default ''
 if ($ovCatalog) { $Config.Esd.CatalogUrl = $ovCatalog; $Config.Esd.UseCatalogApi = $false }
 
@@ -950,7 +960,8 @@ try {
             Exit-Script 11 "Compatibility scan blocked: $hex" "Scan blocked $hex"
         }
 
-        'Stage' {
+        { $_ -in @('Stage','Upgrade') } {
+            $oneShot = ($Mode -eq 'Upgrade')
             # Fast checks only (seconds). Download, media build and setup run in the background
             # StageWorker task, so the RMM job needs no long timeout.
             $task = Get-ScheduledTask -TaskName $StageTaskName -TaskPath $TaskPath -ErrorAction SilentlyContinue
@@ -961,7 +972,7 @@ try {
 
             $state = Get-State
             if ($state.Stage -and $state.Stage.Status -eq 'Staged' -and -not $ForceFlag) {
-                Exit-Script 0 'Already staged. Run Finalize, or use -Force to re-stage.' 'Staged'
+                Exit-Script 0 'Already staged. Run Finalize (or use -Force to re-stage / re-run).' 'Staged'
             }
 
             if (-not $ForceFlag) {
@@ -996,13 +1007,17 @@ try {
             Copy-SelfToWorkRoot
 
             $state = Get-State
-            $state['Stage'] = @{ Status = 'Running'; Step = 'Queued'; Started = (Get-Date).ToString('s'); Unattend = $unattend; PostOobeDir = $postOobeDir }
+            $state['Stage'] = @{ Status = 'Running'; Step = 'Queued'; Started = (Get-Date).ToString('s'); Unattend = $unattend; PostOobeDir = $postOobeDir; MigrateDrivers = $Config.Setup.MigrateDrivers; OneShot = $oneShot }
+            Write-Log "Driver migration for this run: $($Config.Setup.MigrateDrivers)"
             Save-State $state
 
             $workerArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$LocalScriptPath`" -Mode StageWorker"
             if ($ForceFlag) { $workerArgs += ' -Force' }
             Register-AltecTask -Name $StageTaskName -Execute 'powershell.exe' -Arguments $workerArgs -WorkingDir $WorkRoot -LimitHours ([math]::Ceiling($Config.Setup.StageTimeoutMinutes / 60) + 2)
             Start-ScheduledTask -TaskName $StageTaskName -TaskPath $TaskPath
+            if ($oneShot) {
+                Exit-Script 0 "Upgrade started in the background (target $($entry.Build).$($entry.UBR)). Watch the status field: Downloading, Building media, Upgrading, Upgraded - rebooting. The device restarts automatically with a $($Config.Finalize.RebootDelaySeconds)s warning when setup finishes." 'Queued'
+            }
             Exit-Script 0 "Stage started in the background (target $($entry.Build).$($entry.UBR)). Watch the status field: Downloading, Building media, Staging, Staged." 'Queued'
         }
 
@@ -1046,9 +1061,11 @@ try {
             $setupLogDir = Join-Path $LogsDir 'SetupLogs'
             if (-not (Test-Path $setupLogDir)) { New-Item -Path $setupLogDir -ItemType Directory -Force | Out-Null }
             $a = New-Object System.Collections.Generic.List[string]
-            foreach ($x in @('/auto upgrade','/quiet','/eula accept','/skipfinalize',
+            $oneShot = [bool]$state.Stage.OneShot
+            $phaseArg = $(if ($oneShot) { '/noreboot' } else { '/skipfinalize' })
+            foreach ($x in @('/auto upgrade','/quiet','/eula accept',$phaseArg,
                              "/dynamicupdate $($s.DynamicUpdate)", "/priority $($s.Priority)",
-                             "/bitlocker $($s.BitLocker)", "/migratedrivers $($s.MigrateDrivers)",
+                             "/bitlocker $($s.BitLocker)", "/migratedrivers $(if ($state.Stage.MigrateDrivers) { $state.Stage.MigrateDrivers } else { $s.MigrateDrivers })",
                              "/copylogs `"$(Join-Path $LogsDir 'SetupLogs')`"")) { $a.Add($x) }
             if ($s.ShowOOBE)              { $a.Add("/showoobe $($s.ShowOOBE)") }
             if ($s.Telemetry)             { $a.Add("/telemetry $($s.Telemetry)") }
@@ -1060,14 +1077,40 @@ try {
             $state.Stage['Args'] = $stageArgs
             Save-State $state
 
-            Set-Step 'Staging'
+            if ($oneShot) {
+                # Register post-upgrade task before setup so first boot on the new OS is handled.
+                $postArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$LocalScriptPath`" -Mode PostUpgrade"
+                Register-AltecTask -Name $PostTaskName -Execute 'powershell.exe' -Arguments $postArgs -WorkingDir $WorkRoot -AtStartup -LimitHours 2
+                Set-Step 'Upgrading'
+            } else {
+                Set-Step 'Staging'
+            }
             $setupExe = Join-Path $MediaDir 'setup.exe'
             Write-Log "StageWorker: setup.exe $stageArgs"
             $p = Start-Process -FilePath $setupExe -ArgumentList $stageArgs -WorkingDirectory $MediaDir -PassThru -WindowStyle Hidden
             $done = $p.WaitForExit([int]$s.StageTimeoutMinutes * 60000)
-            if (-not $done) { Stop-Stage 30 "Setup did not finish within $($s.StageTimeoutMinutes) min." 'Stage failed - timeout' 'Timeout' }
+            if (-not $done) {
+                if ($oneShot) { Remove-AltecTask $PostTaskName }
+                Stop-Stage 30 "Setup did not finish within $($s.StageTimeoutMinutes) min." 'Stage failed - timeout' 'Timeout'
+            }
 
             $hex = ConvertTo-HexCode $p.ExitCode
+            if ($oneShot) {
+                if ($s.UpgradeSuccessCodes -contains $hex) {
+                    $st = Get-State
+                    $st.Stage['Status'] = 'Upgraded'; $st.Stage['Code'] = $hex; $st.Stage['Step'] = 'Upgraded - rebooting'
+                    $st.Stage['Finished'] = (Get-Date).ToString('s')
+                    $st['Finalize'] = @{ Status = 'Finalized'; Code = $hex; When = (Get-Date).ToString('s'); OneShot = $true }
+                    $st['PostUpgrade'] = @{ Attempts = 0 }
+                    Save-State $st
+                    if ($Config.Finalize.NoReboot) { Exit-Script 0 "Upgrade complete ($hex). Reboot required (NoReboot set)." 'Upgraded - reboot pending' }
+                    $delay = [int]$Config.Finalize.RebootDelaySeconds
+                    & shutdown.exe /r /t $delay /c $Config.Finalize.RebootMessage /d p:2:4 | Out-Null
+                    Exit-Script 0 "Upgrade complete ($hex). Reboot scheduled in $delay seconds." 'Upgraded - rebooting'
+                }
+                Remove-AltecTask $PostTaskName
+                Stop-Stage 30 "Upgrade failed $hex : $(Get-CodeDescription $hex)" "Upgrade failed $hex" $hex
+            }
             if ($s.StageSuccessCodes -contains $hex) {
                 $st = Get-State
                 $st.Stage['Status'] = 'Staged'; $st.Stage['Code'] = $hex; $st.Stage['Step'] = 'Staged'
