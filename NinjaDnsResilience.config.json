@@ -1,0 +1,29 @@
+{
+  "Action": "Audit",
+  "TagComment": "Altec-NinjaOne-NRPT",
+  "DisplayName": "Altec - NinjaOne DNS resilience",
+  "NameServers": ["1.1.1.1", "8.8.8.8"],
+  "Namespaces": [
+    ".ninjarmm.com",
+    ".ninjarmm.net",
+    ".ninjaone.com",
+    ".rmmservice.com",
+    ".rmmservice.eu",
+    ".rmmservice.ca",
+    ".rmmservice.com.au",
+    ".rmmservices.net",
+    ".ninja-backup.com",
+    "ingest.sentry.io",
+    ".ingest.sentry.io",
+    "ninjauploads.s3.amazonaws.com",
+    "ninjaresources.s3.amazonaws.com",
+    "ninja-catalog-release.s3.us-east-1.amazonaws.com",
+    "ninja-attachments.s3.us-west-2.amazonaws.com"
+  ],
+  "ExtraNamespaces": [],
+  "VerifyHosts": ["app.ninjarmm.com", "resources.ninjarmm.com"],
+  "InfoHosts": ["nc-1-us-west-2.ninjarmm.net", "agent-app.ninjarmm.com"],
+  "MinHealthyResolvers": 1,
+  "StatusField": "",
+  "LogDir": "C:\\ProgramData\\Altec\\Logs"
+}
