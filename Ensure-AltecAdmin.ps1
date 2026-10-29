@@ -2,7 +2,8 @@
 <#
 .SYNOPSIS
   Ensure a local break-glass admin account exists, is enabled, has the
-  supplied password, and is a member of the local Administrators group.
+  supplied password, is a member of the local Administrators group, and
+  (by default) is hidden from the Windows sign-in screen.
 
 .DESCRIPTION
   Companion to "Run Autoelevate Removal" for hosts that uninstalled AE but
@@ -12,27 +13,38 @@
   script variable AltecAdminUsername.
 
   Value resolution order (each value):
-    1. CLI parameter (-AccountName / -Password)
+    1. CLI parameter (-AccountName / -Password / -HideFromLogon)
     2. Ninja script variable (environment variable)
-    3. Default ("Altec" for the name; the password has no default)
+    3. Default ("Altec" for the name, $true for HideFromLogon,
+       the password has no default)
+
+  Hide from sign-in screen:
+    Writes a DWORD named after the account (value 0) to
+      HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon\SpecialAccounts\UserList
+    The account still works. Sign in with "Other user" and type .\Altec
+    HideFromLogon = false removes the value if present (unhides the account).
 
   Does NOT remove other Administrators members.
   Does NOT touch the built-in Administrator (RID 500). Refuses if the target
     name resolves to it.
+  Does NOT run on domain controllers (no local SAM accounts there).
   Does NOT remove or rename legacy break-glass accounts (warns only).
   Does NOT touch AutoElevate.
 
   Ninja library setup:
     Name:         Ensure AltecAdmin Break-Glass
     Language:     PowerShell
-    Architecture: 64-bit
+    Architecture: 64-bit   (required; the LocalAccounts module does not load
+                            in 32-bit PowerShell on 64-bit Windows)
     Run as:       SYSTEM
     Script variables:
-      AltecAdminPassword  TEXT, required.
+      AltecAdminPassword       TEXT, required.
         Ninja rejects "!" in values. Type {EXCL} for each "!".
         The script converts {EXCL} to "!" on the endpoint.
-      AltecAdminUsername  TEXT, optional. Blank = "Altec".
+      AltecAdminUsername       TEXT, optional. Blank = "Altec".
         1-20 chars. Not allowed: " / \ [ ] : ; | = , + * ? < > @
+      AltecAdminHideFromLogon  CHECKBOX, optional. Default checked (true).
+        Accepted values: true/false, 1/0, yes/no, on/off.
 
   Full name / description:
     Default name ("Altec")  -> created with the Altec full name and description.
@@ -47,14 +59,18 @@
     10 = Password missing
     11 = Invalid account name
     12 = Target name is the built-in Administrator (RID 500), refused
+    13 = Host is a domain controller, refused
+    14 = Running in 32-bit PowerShell on 64-bit Windows, refused
     20 = Create / password reset / enable failed
     30 = Add to Administrators failed
     40 = Verification failed
+    50 = Hide/unhide from sign-in screen failed
 #>
 [CmdletBinding()]
 param(
     [string]$AccountName,
-    [string]$Password
+    [string]$Password,
+    [string]$HideFromLogon
 )
 
 Set-StrictMode -Version Latest
@@ -62,13 +78,16 @@ $ErrorActionPreference = 'Continue'
 
 # ---------------- config ----------------
 $DefaultAccountName    = 'Altec'
+$DefaultHideFromLogon  = $true
 $NinjaVarAccountName   = 'AltecAdminUsername'
 $NinjaVarPassword      = 'AltecAdminPassword'
+$NinjaVarHideFromLogon = 'AltecAdminHideFromLogon'
 $LegacyAccountNames    = @('altecadmin', 'altec')   # warn-only if present alongside target
 $AccountFullName       = 'Altec Break Glass'
 $AccountDescription    = 'Altec MSP break-glass local administrator'
 $AdminsSid             = 'S-1-5-32-544'             # locale-independent Administrators
 $UF_DONT_EXPIRE_PASSWD = 0x10000
+$UserListPath          = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon\SpecialAccounts\UserList'
 
 $script:Computer = $env:COMPUTERNAME
 $script:LogDir   = 'C:\ProgramData\Altec'
@@ -78,6 +97,7 @@ $script:Errors   = 0
 $script:ExitCode = 0
 $script:Account  = ''
 $script:UseDefaultLabels = $true
+$script:HideState = 'NOT_CHECKED'
 $script:Actions  = New-Object System.Collections.Generic.List[string]
 
 # ---------------- helpers ----------------
@@ -118,6 +138,17 @@ function Resolve-Value {
         return [pscustomobject]@{ Value = ($envVal -replace '\{EXCL\}', '!').Trim(); Source = 'Ninja variable' }
     }
     return [pscustomobject]@{ Value = $Default; Source = 'default' }
+}
+
+function ConvertTo-BoolOrNull {
+    # Returns $true / $false, or $null if the text is not a recognized boolean
+    param([string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
+    switch -Regex ($Text.Trim()) {
+        '^(1|true|yes|y|on)$'   { return $true }
+        '^(0|false|no|n|off)$'  { return $false }
+        default                 { return $null }
+    }
 }
 
 function Test-AccountName {
@@ -192,26 +223,90 @@ function Clear-Lockout {
     return $false
 }
 
+function Get-UserListEntry {
+    # Returns @{ Exists; Value; Kind } for the account's UserList value
+    param([string]$Name)
+    $r = [pscustomobject]@{ Exists = $false; Value = $null; Kind = $null }
+    if (-not (Test-Path -LiteralPath $UserListPath)) { return $r }
+    $key = Get-Item -LiteralPath $UserListPath -ErrorAction Stop
+    if ($key.GetValueNames() -icontains $Name) {
+        $r.Exists = $true
+        $r.Value  = $key.GetValue($Name)
+        $r.Kind   = $key.GetValueKind($Name).ToString()
+    }
+    return $r
+}
+
+function Test-IsHidden {
+    param([string]$Name)
+    $e = Get-UserListEntry -Name $Name
+    return ($e.Exists -and $e.Kind -eq 'DWord' -and [int]$e.Value -eq 0)
+}
+
+function Set-HiddenFromLogon {
+    param([string]$Name)
+    if (Test-IsHidden -Name $Name) { return $false }
+    if (-not (Test-Path -LiteralPath $UserListPath)) {
+        New-Item -Path $UserListPath -Force -ErrorAction Stop | Out-Null
+    }
+    # -Force overwrites a wrong-type value (e.g. REG_SZ "0") with a DWORD
+    New-ItemProperty -LiteralPath $UserListPath -Name $Name -PropertyType DWord -Value 0 -Force -ErrorAction Stop | Out-Null
+    return $true
+}
+
+function Clear-HiddenFromLogon {
+    param([string]$Name)
+    $e = Get-UserListEntry -Name $Name
+    if (-not $e.Exists) { return $false }
+    Remove-ItemProperty -LiteralPath $UserListPath -Name $Name -ErrorAction Stop
+    return $true
+}
+
 # ---------------- main ----------------
 Write-Log INFO ('===== Ensure-AltecAdmin starting on {0} =====' -f $script:Computer)
 
-$acctRes = Resolve-Value -CliValue $AccountName -EnvName $NinjaVarAccountName -Default $DefaultAccountName
-$pwRes   = Resolve-Value -CliValue $Password    -EnvName $NinjaVarPassword    -Default ''
+# Environment guards
+if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) {
+    Set-Failed 14 'Running in 32-bit PowerShell on 64-bit Windows. Set the Ninja script architecture to 64-bit.'
+}
+if ($script:ExitCode -eq 0) {
+    try {
+        $role = (Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop).DomainRole
+        if ($role -ge 4) {
+            Set-Failed 13 'Host is a domain controller. Local accounts do not exist on DCs. Refusing.'
+        }
+    } catch {
+        Write-Log WARN ('Could not determine domain role: {0}' -f $_.Exception.Message)
+    }
+}
+
+$acctRes = Resolve-Value -CliValue $AccountName   -EnvName $NinjaVarAccountName   -Default $DefaultAccountName
+$pwRes   = Resolve-Value -CliValue $Password      -EnvName $NinjaVarPassword      -Default ''
+$hideRes = Resolve-Value -CliValue $HideFromLogon -EnvName $NinjaVarHideFromLogon -Default ([string]$DefaultHideFromLogon)
 $script:Account = $acctRes.Value
 $plain          = $pwRes.Value
+
+$hideBool = ConvertTo-BoolOrNull -Text $hideRes.Value
+if ($null -eq $hideBool) {
+    Write-Log WARN ("HideFromLogon value '{0}' not recognized. Using default ({1})." -f $hideRes.Value, $DefaultHideFromLogon)
+    $hideBool = $DefaultHideFromLogon
+}
 
 # Altec full name/description only apply to the default account name
 $script:UseDefaultLabels = ($script:Account -ieq $DefaultAccountName)
 
 Write-Log INFO ('Target account: {0} (source: {1}, Altec labels: {2})' -f $script:Account, $acctRes.Source, $script:UseDefaultLabels)
+Write-Log INFO ('Hide from sign-in screen: {0} (source: {1})' -f $hideBool, $hideRes.Source)
 
-$nameProblem = Test-AccountName -Name $script:Account
-if ($nameProblem) {
-    Set-Failed 11 ("Account name '{0}' {1}." -f $script:Account, $nameProblem)
-} elseif ([string]::IsNullOrWhiteSpace($plain)) {
-    Set-Failed 10 'AltecAdminPassword is empty. Set the Ninja script variable (type {EXCL} for each !).'
-} else {
-    Write-Log INFO ('Password resolved from {0} (length={1}).' -f $pwRes.Source, $plain.Length)
+if ($script:ExitCode -eq 0) {
+    $nameProblem = Test-AccountName -Name $script:Account
+    if ($nameProblem) {
+        Set-Failed 11 ("Account name '{0}' {1}." -f $script:Account, $nameProblem)
+    } elseif ([string]::IsNullOrWhiteSpace($plain)) {
+        Set-Failed 10 'AltecAdminPassword is empty. Set the Ninja script variable (type {EXCL} for each !).'
+    } else {
+        Write-Log INFO ('Password resolved from {0} (length={1}).' -f $pwRes.Source, $plain.Length)
+    }
 }
 
 # Create or reset
@@ -224,8 +319,8 @@ if ($script:ExitCode -eq 0) {
     } elseif ($existing) {
         Write-Log INFO ('Account {0} exists. Resetting password and ensuring enabled.' -f $script:Account)
         try {
-            Set-LocalUser -Name $script:Account -Password $sec -PasswordNeverExpires $true -ErrorAction Stop
-            Write-Log OK 'Password reset'
+            Set-LocalUser -Name $script:Account -Password $sec -PasswordNeverExpires $true -AccountNeverExpires -ErrorAction Stop
+            Write-Log OK 'Password reset (password and account set to never expire)'
             $script:Actions.Add('PASSWORD_RESET')
         } catch {
             Set-Failed 20 ('Password reset failed: {0}' -f $_.Exception.Message)
@@ -254,6 +349,7 @@ if ($script:ExitCode -eq 0) {
                 Name                 = $script:Account
                 Password             = $sec
                 PasswordNeverExpires = $true
+                AccountNeverExpires  = $true
                 ErrorAction          = 'Stop'
             }
             if ($script:UseDefaultLabels) {
@@ -310,6 +406,42 @@ if ($script:ExitCode -eq 0) {
     }
 }
 
+# Hide / unhide from sign-in screen + verify
+if ($script:ExitCode -eq 0) {
+    try {
+        if ($hideBool) {
+            if (Set-HiddenFromLogon -Name $script:Account) {
+                Write-Log OK ('Hidden from sign-in screen (UserList\{0} = 0)' -f $script:Account)
+                $script:Actions.Add('HIDDEN')
+            } else {
+                Write-Log INFO 'Already hidden from sign-in screen'
+            }
+            if (Test-IsHidden -Name $script:Account) {
+                $script:HideState = 'HIDDEN'
+            } else {
+                Set-Failed 50 'Verify failed: UserList value missing or not DWORD 0 after write.'
+                $script:HideState = 'FAILED'
+            }
+        } else {
+            if (Clear-HiddenFromLogon -Name $script:Account) {
+                Write-Log OK ('Removed UserList\{0} (account visible on sign-in screen)' -f $script:Account)
+                $script:Actions.Add('UNHIDDEN')
+            } else {
+                Write-Log INFO 'Not hidden; nothing to remove'
+            }
+            if ((Get-UserListEntry -Name $script:Account).Exists) {
+                Set-Failed 50 'Verify failed: UserList value still present after removal.'
+                $script:HideState = 'FAILED'
+            } else {
+                $script:HideState = 'VISIBLE'
+            }
+        }
+    } catch {
+        Set-Failed 50 ('Hide/unhide failed: {0}' -f $_.Exception.Message)
+        $script:HideState = 'FAILED'
+    }
+}
+
 # Legacy account notice (read-only)
 foreach ($legacy in $LegacyAccountNames) {
     if ($legacy -ieq $script:Account) { continue }
@@ -322,6 +454,7 @@ foreach ($legacy in $LegacyAccountNames) {
 $plain = $null
 $Password = $null
 $pwRes = $null
+$sec = $null
 [GC]::Collect()
 
 $status = if ($script:ExitCode -eq 0) { 'SUCCESS' } else { 'FAILED' }
@@ -332,6 +465,7 @@ $block = @"
 STATUS              : $status
 COMPUTER            : $($script:Computer)
 ACCOUNT             : $($script:Account)
+SIGN-IN SCREEN      : $($script:HideState)
 ACTIONS             : $([string]::Join(', ', $script:Actions))
 WARNINGS            : $($script:Warnings)
 ERRORS              : $($script:Errors)
